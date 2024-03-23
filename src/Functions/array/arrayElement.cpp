@@ -33,6 +33,13 @@ namespace ErrorCodes
     extern const int ZERO_ARRAY_OR_TUPLE_INDEX;
 }
 
+enum class ArrayElementStrategy
+{
+    OrNull,
+    OrDefault,
+    Default
+};
+
 namespace
 {
 
@@ -44,6 +51,7 @@ namespace ArrayImpl
 /** arrayElement(arr, i) - get the array element by index. If index is not constant and out of range - return default value of data type.
   * The index begins with 1. Also, the index can be negative - then it is counted from the end of the array.
   */
+template <ArrayElementStrategy strategy>
 class FunctionArrayElement : public IFunction
 {
 public:
@@ -213,7 +221,7 @@ private:
 namespace
 {
 
-template <typename T>
+template <ArrayElementStrategy strategy, typename T>
 struct ArrayElementNumImpl
 {
     /** Implementation for constant index.
@@ -435,8 +443,10 @@ struct ArrayElementArrayNumImpl
                 ColumnArray::Offset nested_array_size = nested_offsets[j] - nested_offsets[j-1];
                 ColumnArray::Offset nested_array_pos = nested_offsets[j-1];
                 memcpy(&result_data[current_offset], &data[nested_array_pos], nested_array_size * sizeof(T));
-                if constexpr (nullable_number)
-                    memcpy(&(*result_number_null_map)[current_offset], &(*number_null_map)[nested_array_pos], nested_array_size);
+                if constexpr (nullable_number) {
+                    if (number_null_map)
+                        memcpy(&(*result_number_null_map)[current_offset], &(*number_null_map)[nested_array_pos], nested_array_size);
+                }
 
                 current_offset += nested_array_size;
             }
@@ -454,10 +464,8 @@ struct ArrayElementArrayNumImpl
 
                 current_offset += nested_array_size;
             }
-            else
-            {
-                /// Empty Array(T), no need to copy anything
-                if (builder)
+            else {
+                if (builder) /// Empty Array(T), no need to copy anything
                     builder.update();
             }
 
@@ -865,9 +873,10 @@ struct ArrayElementGenericImpl
             }
             else
             {
-                result.insertDefault();
-                if (builder)
+                if (builder) {
                     builder.update();
+                }
+                result.insertDefault();
             }
 
             current_offset = offsets[i];
@@ -878,14 +887,16 @@ struct ArrayElementGenericImpl
 }
 
 
-FunctionPtr FunctionArrayElement::create(ContextPtr)
+template <ArrayElementStrategy strategy>
+FunctionPtr FunctionArrayElement<strategy>::create(ContextPtr)
 {
     return std::make_shared<FunctionArrayElement>();
 }
 
 
+template <ArrayElementStrategy strategy>
 template <typename DataType>
-ColumnPtr FunctionArrayElement::executeNumberConst(
+ColumnPtr FunctionArrayElement<strategy>::executeNumberConst(
     const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, const Field & index, ArrayImpl::NullMapBuilder & builder)
 {
     using ColVecType = ColumnVectorOrDecimal<DataType>;
@@ -906,7 +917,7 @@ ColumnPtr FunctionArrayElement::executeNumberConst(
     if (index.getType() == Field::Types::UInt64
         || (index.getType() == Field::Types::Int64 && index.get<Int64>() >= 0))
     {
-        ArrayElementNumImpl<DataType>::template vectorConst<false>(
+        ArrayElementNumImpl<strategy, DataType>::template vectorConst<false>(
             col_nested->getData(), col_array->getOffsets(), index.get<UInt64>() - 1, col_res_vec->getData(), builder);
     }
     else if (index.getType() == Field::Types::Int64)
@@ -919,7 +930,7 @@ ColumnPtr FunctionArrayElement::executeNumberConst(
         /// Negative array indices work this way:
         /// arr[-1] is the element at offset 0 from the last
         /// arr[-2] is the element at offset 1 from the last and so on.
-        ArrayElementNumImpl<DataType>::template vectorConst<true>(
+        ArrayElementNumImpl<strategy, DataType>::template vectorConst<true>(
             col_nested->getData(), col_array->getOffsets(), -(static_cast<UInt64>(index.safeGet<Int64>()) + 1), col_res_vec->getData(), builder);
     }
     else
@@ -928,8 +939,9 @@ ColumnPtr FunctionArrayElement::executeNumberConst(
     return col_res;
 }
 
+template <ArrayElementStrategy strategy>
 template <typename IndexType, typename DataType>
-ColumnPtr FunctionArrayElement::executeNumber(
+ColumnPtr FunctionArrayElement<strategy>::executeNumber(
     const ColumnsWithTypeAndName & arguments,
     const DataTypePtr & result_type,
     const PaddedPODArray<IndexType> & indices,
@@ -950,14 +962,15 @@ ColumnPtr FunctionArrayElement::executeNumber(
     if (!col_res_vec)
         return nullptr;
 
-    ArrayElementNumImpl<DataType>::template vector<IndexType>(
+    ArrayElementNumImpl<strategy, DataType>::template vector<IndexType>(
         col_nested->getData(), col_array->getOffsets(), indices, col_res_vec->getData(), builder);
 
     return col_res;
 }
 
+template <ArrayElementStrategy strategy>
 ColumnPtr
-FunctionArrayElement::executeStringConst(const ColumnsWithTypeAndName & arguments, const Field & index, ArrayImpl::NullMapBuilder & builder)
+FunctionArrayElement<strategy>::executeStringConst(const ColumnsWithTypeAndName & arguments, const Field & index, ArrayImpl::NullMapBuilder & builder)
 {
     const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
 
@@ -1020,7 +1033,8 @@ FunctionArrayElement::executeStringConst(const ColumnsWithTypeAndName & argument
     return col_res;
 }
 
-ColumnPtr FunctionArrayElement::executeArrayStringConst(
+template <ArrayElementStrategy strategy>
+ColumnPtr FunctionArrayElement<strategy>::executeArrayStringConst(
     const ColumnsWithTypeAndName & arguments, const Field & index, ArrayImpl::NullMapBuilder & builder)
 {
     const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
@@ -1077,7 +1091,7 @@ ColumnPtr FunctionArrayElement::executeArrayStringConst(
     }
     else if (index.getType() == Field::Types::Int64)
     {
-        if (col_nullable)
+        if (col_nullable || strategy == ArrayElementStrategy::OrNull)
             ArrayElementArrayStringImpl::vectorConst<true, true>(
                 col_nested_elem->getChars(),
                 col_array->getOffsets(),
@@ -1107,14 +1121,15 @@ ColumnPtr FunctionArrayElement::executeArrayStringConst(
     else
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Illegal type of array index");
 
-    if (col_nullable)
+    if (col_nullable || strategy == ArrayElementStrategy::OrNull)
         return ColumnArray::create(ColumnNullable::create(std::move(res_string), std::move(res_string_null_map)), std::move(res_offsets));
     else
         return ColumnArray::create(std::move(res_string), std::move(res_offsets));
 }
 
+template <ArrayElementStrategy strategy>
 template <typename DataType>
-ColumnPtr FunctionArrayElement::executeArrayNumberConst(
+ColumnPtr FunctionArrayElement<strategy>::executeArrayNumberConst(
     const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, const Field & index, ArrayImpl::NullMapBuilder & builder)
 {
     using ColVecType = ColumnVectorOrDecimal<DataType>;
@@ -1217,8 +1232,9 @@ ColumnPtr FunctionArrayElement::executeArrayNumberConst(
     return res;
 }
 
+template <ArrayElementStrategy strategy>
 template <typename IndexType, typename DataType>
-ColumnPtr FunctionArrayElement::executeArrayNumber(
+ColumnPtr FunctionArrayElement<strategy>::executeArrayNumber(
     const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, const PaddedPODArray<IndexType> & indices, ArrayImpl::NullMapBuilder & builder)
 {
     using ColVecType = ColumnVectorOrDecimal<DataType>;
@@ -1257,7 +1273,7 @@ ColumnPtr FunctionArrayElement::executeArrayNumber(
     auto & res_offsets = res_array->getOffsets();
     NullMap * res_null_map = res_nullable ? &res_nullable->getNullMapData() : nullptr;
 
-    if (col_nullable)
+    if (col_nullable || strategy == ArrayElementStrategy::OrNull)
         ArrayElementArrayNumImpl<DataType>::template vector<IndexType, true>(
             col_nested_elem->getData(),
             col_array->getOffsets(),
@@ -1282,8 +1298,9 @@ ColumnPtr FunctionArrayElement::executeArrayNumber(
     return res;
 }
 
+template <ArrayElementStrategy strategy>
 template <typename IndexType>
-ColumnPtr FunctionArrayElement::executeString(
+ColumnPtr FunctionArrayElement<strategy>::executeString(
     const ColumnsWithTypeAndName & arguments, const PaddedPODArray<IndexType> & indices, ArrayImpl::NullMapBuilder & builder)
 {
     const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
@@ -1320,8 +1337,9 @@ ColumnPtr FunctionArrayElement::executeString(
     return col_res;
 }
 
+template <ArrayElementStrategy strategy>
 template <typename IndexType>
-ColumnPtr FunctionArrayElement::executeArrayString(
+ColumnPtr FunctionArrayElement<strategy>::executeArrayString(
     const ColumnsWithTypeAndName & arguments, const PaddedPODArray<IndexType> & indices, ArrayImpl::NullMapBuilder & builder)
 {
     const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
@@ -1345,7 +1363,7 @@ ColumnPtr FunctionArrayElement::executeArrayString(
     const auto * string_null_map = col_nullable ? &col_nullable->getNullMapColumn() : nullptr;
     auto res_string = ColumnString::create();
     auto res_offsets = ColumnArray::ColumnOffsets::create();
-    auto res_string_null_map = col_nullable ? ColumnUInt8::create() : nullptr;
+    auto res_string_null_map = col_nullable || strategy == ArrayElementStrategy::OrNull ? ColumnUInt8::create() : nullptr;
 
     if (col_nullable)
         ArrayElementArrayStringImpl::vector<IndexType, true>(
@@ -1374,13 +1392,13 @@ ColumnPtr FunctionArrayElement::executeArrayString(
             nullptr,
             builder);
 
-    if (col_nullable)
+    if (col_nullable || strategy == ArrayElementStrategy::OrNull)
         return ColumnArray::create(ColumnNullable::create(std::move(res_string), std::move(res_string_null_map)), std::move(res_offsets));
     else
         return ColumnArray::create(std::move(res_string), std::move(res_offsets));
 }
-
-ColumnPtr FunctionArrayElement::executeGenericConst(
+template <ArrayElementStrategy strategy>
+ColumnPtr FunctionArrayElement<strategy>::executeGenericConst(
     const ColumnsWithTypeAndName & arguments, const Field & index, ArrayImpl::NullMapBuilder & builder)
 {
     const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
@@ -1404,8 +1422,9 @@ ColumnPtr FunctionArrayElement::executeGenericConst(
     return col_res;
 }
 
+template <ArrayElementStrategy strategy>
 template <typename IndexType>
-ColumnPtr FunctionArrayElement::executeGeneric(
+ColumnPtr FunctionArrayElement<strategy>::executeGeneric(
     const ColumnsWithTypeAndName & arguments, const PaddedPODArray<IndexType> & indices, ArrayImpl::NullMapBuilder & builder)
 {
     const ColumnArray * col_array = checkAndGetColumn<ColumnArray>(arguments[0].column.get());
@@ -1422,8 +1441,9 @@ ColumnPtr FunctionArrayElement::executeGeneric(
     return col_res;
 }
 
+template <ArrayElementStrategy strategy>
 template <typename IndexType>
-ColumnPtr FunctionArrayElement::executeConst(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
+ColumnPtr FunctionArrayElement<strategy>::executeConst(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
                                         const PaddedPODArray <IndexType> & indices, ArrayImpl::NullMapBuilder & builder,
                                         size_t input_rows_count)
 {
@@ -1466,8 +1486,9 @@ ColumnPtr FunctionArrayElement::executeConst(const ColumnsWithTypeAndName & argu
     return res;
 }
 
+template <ArrayElementStrategy strategy>
 template <typename IndexType>
-ColumnPtr FunctionArrayElement::executeArgument(
+ColumnPtr FunctionArrayElement<strategy>::executeArgument(
     const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, ArrayImpl::NullMapBuilder & builder, size_t input_rows_count) const
 {
     auto index = checkAndGetColumn<ColumnVector<IndexType>>(arguments[1].column.get());
@@ -1527,7 +1548,8 @@ ColumnPtr FunctionArrayElement::executeArgument(
     return res;
 }
 
-ColumnPtr FunctionArrayElement::executeMap2(const ColumnsWithTypeAndName & arguments, size_t input_rows_count) const
+template <ArrayElementStrategy strategy>
+ColumnPtr FunctionArrayElement<strategy>::executeMap2(const ColumnsWithTypeAndName & arguments, size_t input_rows_count) const
 {
     const ColumnArray * col_array = typeid_cast<const ColumnArray *>(arguments[0].column.get());
     if (!col_array)
@@ -1585,7 +1607,8 @@ ColumnPtr FunctionArrayElement::executeMap2(const ColumnsWithTypeAndName & argum
     return ColumnMap::create(std::move(result_nested_column));
 }
 
-ColumnPtr FunctionArrayElement::executeTuple(const ColumnsWithTypeAndName & arguments, size_t input_rows_count) const
+template <ArrayElementStrategy strategy>
+ColumnPtr FunctionArrayElement<strategy>::executeTuple(const ColumnsWithTypeAndName & arguments, size_t input_rows_count) const
 {
     const ColumnArray * col_array = typeid_cast<const ColumnArray *>(arguments[0].column.get());
     if (!col_array)
@@ -1688,8 +1711,9 @@ struct MatcherNumberConst
 
 }
 
+template <ArrayElementStrategy strategy>
 template <typename Matcher>
-void FunctionArrayElement::executeMatchKeyToIndex(
+void FunctionArrayElement<strategy>::executeMatchKeyToIndex(
     const Offsets & offsets, PaddedPODArray<UInt64> & matched_idxs, const Matcher & matcher)
 {
     size_t rows = offsets.size();
@@ -1751,8 +1775,9 @@ void FunctionArrayElement::executeMatchKeyToIndex(
     }
 }
 
+template <ArrayElementStrategy strategy>
 template <typename Matcher>
-void FunctionArrayElement::executeMatchConstKeyToIndex(
+void FunctionArrayElement<strategy>::executeMatchConstKeyToIndex(
     size_t num_rows, size_t num_values,
     PaddedPODArray<UInt64> & matched_idxs, const Matcher & matcher)
 {
@@ -1780,7 +1805,8 @@ bool castColumnString(const IColumn * column, F && f)
     return castTypeToEither<ColumnString, ColumnFixedString>(column, std::forward<F>(f));
 }
 
-bool FunctionArrayElement::matchKeyToIndexStringConst(
+template <ArrayElementStrategy strategy>
+bool FunctionArrayElement<strategy>::matchKeyToIndexStringConst(
     const IColumn & data, const Offsets & offsets,
     const Field & index, PaddedPODArray<UInt64> & matched_idxs)
 {
@@ -1795,7 +1821,8 @@ bool FunctionArrayElement::matchKeyToIndexStringConst(
     });
 }
 
-bool FunctionArrayElement::matchKeyToIndexString(
+template <ArrayElementStrategy strategy>
+bool FunctionArrayElement<strategy>::matchKeyToIndexString(
     const IColumn & data, const Offsets & offsets, bool is_key_const,
     const IColumn & index, PaddedPODArray<UInt64> & matched_idxs)
 {
@@ -1845,7 +1872,8 @@ bool castColumnNumeric(const IColumn * column, F && f)
     >(column, std::forward<F>(f));
 }
 
-bool FunctionArrayElement::matchKeyToIndexNumberConst(
+template <ArrayElementStrategy strategy>
+bool FunctionArrayElement<strategy>::matchKeyToIndexNumberConst(
     const IColumn & data, const Offsets & offsets,
     const Field & index, PaddedPODArray<UInt64> & matched_idxs)
 {
@@ -1870,7 +1898,8 @@ bool FunctionArrayElement::matchKeyToIndexNumberConst(
     });
 }
 
-bool FunctionArrayElement::matchKeyToIndexNumber(
+template <ArrayElementStrategy strategy>
+bool FunctionArrayElement<strategy>::matchKeyToIndexNumber(
     const IColumn & data, const Offsets & offsets, bool is_key_const,
     const IColumn & index, PaddedPODArray<UInt64> & matched_idxs)
 {
@@ -1897,7 +1926,8 @@ bool FunctionArrayElement::matchKeyToIndexNumber(
     });
 }
 
-ColumnPtr FunctionArrayElement::executeMap(
+template <ArrayElementStrategy strategy>
+ColumnPtr FunctionArrayElement<strategy>::executeMap(
     const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
 {
     const auto * col_map = checkAndGetColumn<ColumnMap>(arguments[0].column.get());
@@ -1959,15 +1989,20 @@ ColumnPtr FunctionArrayElement::executeMap(
     return executeImpl(new_arguments, result_type, input_rows_count);
 }
 
-String FunctionArrayElement::getName() const
+template <ArrayElementStrategy strategy>
+String FunctionArrayElement<strategy>::getName() const
 {
     return name;
 }
 
-DataTypePtr FunctionArrayElement::getReturnTypeImpl(const DataTypes & arguments) const
+template <ArrayElementStrategy strategy>
+DataTypePtr FunctionArrayElement<strategy>::getReturnTypeImpl(const DataTypes & arguments) const
 {
-    if (const auto * map_type = checkAndGetDataType<DataTypeMap>(arguments[0].get()))
+    if (const auto * map_type = checkAndGetDataType<DataTypeMap>(arguments[0].get())) {
+        if (strategy == ArrayElementStrategy::OrNull || context->getSettingsRef().array_element_use_or_null)
+            return std::make_shared<DataTypeNullable>(map_type->getValueType());
         return map_type->getValueType();
+    }
 
     const auto * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
     if (!array_type)
@@ -1983,11 +2018,14 @@ DataTypePtr FunctionArrayElement::getReturnTypeImpl(const DataTypes & arguments)
             "Second argument for function '{}' must be integer, got '{}' instead",
             getName(), arguments[1]->getName());
     }
+    if (strategy == ArrayElementStrategy::OrNull || context->getSettingsRef().array_element_use_or_null)
+        return std::make_shared<DataTypeNullable>(array_type->getNestedType());
 
     return array_type->getNestedType();
 }
 
-ColumnPtr FunctionArrayElement::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
+template <ArrayElementStrategy strategy>
+ColumnPtr FunctionArrayElement<strategy>::executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type, size_t input_rows_count) const
 {
     const auto * col_map = checkAndGetColumn<ColumnMap>(arguments[0].column.get());
     const auto * col_const_map = checkAndGetColumnConst<ColumnMap>(arguments[0].column.get());
@@ -2015,10 +2053,18 @@ ColumnPtr FunctionArrayElement::executeImpl(const ColumnsWithTypeAndName & argum
             arguments[0].column->getName(), getName());
     }
 
-    if (!is_array_of_nullable)
-    {
+    if (!is_array_of_nullable) {
         ArrayImpl::NullMapBuilder builder;
-        return perform(arguments, result_type, builder, input_rows_count);
+
+        if constexpr (strategy == ArrayElementStrategy::OrNull)
+            builder.initSource(ColumnUInt8::create(input_rows_count)->getData().data());
+
+        auto res = perform(arguments, result_type, builder, input_rows_count);
+        if constexpr (strategy == ArrayElementStrategy::OrNull) {
+            return ColumnNullable::create(res, std::move(builder).getNullMapColumnPtr());
+        }
+
+        return res;
     }
     else
     {
@@ -2075,7 +2121,8 @@ ColumnPtr FunctionArrayElement::executeImpl(const ColumnsWithTypeAndName & argum
     }
 }
 
-ColumnPtr FunctionArrayElement::perform(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
+template <ArrayElementStrategy strategy>
+ColumnPtr FunctionArrayElement<strategy>::perform(const ColumnsWithTypeAndName & arguments, const DataTypePtr & result_type,
                                    ArrayImpl::NullMapBuilder & builder, size_t input_rows_count) const
 {
     ColumnPtr res;
@@ -2161,10 +2208,42 @@ ColumnPtr FunctionArrayElement::perform(const ColumnsWithTypeAndName & arguments
 
 }
 
+// struct NameArrayElementOrNull { static constexpr auto name = "arrayElementOrNull"; };
+// using FunctionArrayElementOrNull = FunctionArrayElement<ArrayElementStrategy::OrNull>;
+// using FunctionArrayElementOrNull = FunctionArrayMapped<ArrayElementOrNullImpl, NameArrayElementOrNull>;
+
+// struct NameArrayElementOrDefault { static constexpr auto name = "arrayElementOrDefault"; };
+// using FunctionArrayElementOrDefault = FunctionArrayElement<ArrayElementStrategy::OrDefault>;
+// using FunctionArrayElementOrDefault = FunctionArrayMapped<ArrayElementOrDefaultImpl, NameArrayElementOrDefault>;
+
+// struct NameArrayElement { static constexpr auto name = "arrayElement"; };
+// using FunctionArrayElementDefault = FunctionArrayElement<ArrayElementStrategy::Default>;
+//using FunctionArrayElementDefault = FunctionArrayMapped<ArrayElementDefaultImpl, NameArrayElement>;
+
+
+class FunctionArrayElementOrNull : public FunctionArrayElement<ArrayElementStrategy::OrNull>
+{
+public:
+    static constexpr auto name = "arrayElementOrNull";
+};
+
+class FunctionArrayElementOrDefault : public FunctionArrayElement<ArrayElementStrategy::OrDefault>
+{
+public:
+    static constexpr auto name = "arrayElementOrDefault";
+};
+
+class FunctionArrayElementDefault : public FunctionArrayElement<ArrayElementStrategy::Default>
+{
+public:
+    static constexpr auto name = "arrayElement";
+};
 
 REGISTER_FUNCTION(ArrayElement)
 {
-    factory.registerFunction<FunctionArrayElement>();
+    factory.registerFunction<FunctionArrayElementOrNull>();
+    factory.registerFunction<FunctionArrayElementOrDefault>();
+    factory.registerFunction<FunctionArrayElementDefault>();
 }
 
 }
