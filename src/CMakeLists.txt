@@ -34,7 +34,9 @@ else()
 endif()
 
 set(dbms_headers)
-set(dbms_sources)
+set(dbms_sources
+        Disks/DiskObjectStorage/ObjectStorages/GCS/GCSBlobStorageCommon.cpp
+        Disks/DiskObjectStorage/ObjectStorages/GCS/GCSBlobStorageCommon.h)
 
 add_subdirectory (Access)
 add_subdirectory (Backups)
@@ -105,6 +107,7 @@ add_headers_and_sources(clickhouse_common_io IO/Protobuf)
 add_headers_and_sources(clickhouse_common_io IO/S3)
 add_headers_and_sources(clickhouse_common_io IO/AzureBlobStorage)
 add_headers_and_sources(clickhouse_common_io Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage)
+add_headers_and_sources(clickhouse_common_io Disks/DiskObjectStorage/ObjectStorages/GCS)
 list (REMOVE_ITEM clickhouse_common_io_sources Common/malloc.cpp Common/AllocationInterceptors.cpp)
 
 
@@ -170,6 +173,10 @@ endif()
 if (TARGET ch_contrib::azure_sdk)
     add_headers_and_sources(dbms Disks/DiskObjectStorage/ObjectStorages/AzureBlobStorage)
     add_headers_and_sources(dbms IO/AzureBlobStorage)
+endif()
+
+if (TARGET ch_contrib::google_cloud_cpp)
+    add_headers_and_sources(dbms Disks/DiskObjectStorage/ObjectStorages/GCS)
 endif()
 
 if (TARGET ch_contrib::hdfs)
@@ -577,6 +584,10 @@ endif()
 if (TARGET ch_contrib::azure_sdk)
     target_link_libraries (clickhouse_common_io PUBLIC ch_contrib::azure_sdk)
     target_link_libraries(dbms PRIVATE ch_contrib::azure_sdk)
+endif()
+
+if (TARGET ch_contrib::google_cloud_cpp)
+    target_link_libraries (clickhouse_common_io PUBLIC ch_contrib::google_cloud_cpp)
 endif()
 
 if (TARGET ch_contrib::s2)

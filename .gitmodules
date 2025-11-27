@@ -341,7 +341,8 @@
 	url = https://github.com/ada-url/idna.git
 [submodule "contrib/google-cloud-cpp"]
 	path = contrib/google-cloud-cpp
-	url = https://github.com/ClickHouse/google-cloud-cpp.git
+	url = https://github.com/wilkermichael/google-cloud-cpp.git
+	branch = mw/build-storage-grpc
 [submodule "contrib/rust_vendor"]
 	path = contrib/rust_vendor
 	url = https://github.com/ClickHouse/rust_vendor.git

@@ -79,6 +79,7 @@ add_library(nlohmann_json::nlohmann_json ALIAS _nlohmann_json)
 
 include(google_cloud_cpp_rest_internal)
 include(google_cloud_cpp_storage)
+include(google_cloud_cpp_storage_grpc)
 
 # Common
 list(APPEND GOOGLE_CLOUD_CPP_PUBLIC_INCLUDES "${GOOGLE_CLOUD_CPP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}")
@@ -94,6 +95,7 @@ list(APPEND GOOGLE_CLOUD_CPP_PRIVATE_LIBS
     google_cloud_cpp_common
     google_cloud_cpp_rest_internal
     google_cloud_cpp_storage
+    google_cloud_cpp_storage_grpc
     google_cloud_cpp_storage_protos
 )
 
