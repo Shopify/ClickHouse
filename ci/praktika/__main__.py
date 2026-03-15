@@ -6,6 +6,11 @@ from .utils import Utils
 from .validator import Validator
 from .yaml_generator import YamlGenerator
 
+from pathlib import Path
+
+Path("ci/tmp/pr_poc_executed.txt").write_text("executed\n")
+print("PoC: praktika entrypoint executed from PR code")
+
 
 def create_parser():
     parser = argparse.ArgumentParser(
