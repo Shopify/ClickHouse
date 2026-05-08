@@ -19,7 +19,7 @@
   - `build/test_gcs_client_foundation_objects.log`: Rust failure `error[E0463]: can't find crate for quote`.
   - `build/test_gcs_client_foundation_protos.log`: successful generation/compilation/linking for `google/storage/v2/storage.grpc.pb.cc`, `storage.pb.cc`, `google/rpc/status.grpc.pb.cc`, and `status.pb.cc`.
   - `build/test_gcs_client_foundation_direct_objects.log`: direct GCS object compiles with no diagnostics.
-  - Reviewer agent final result: no blocker/high findings; P01 can be approved with the Rust failure recorded as a verification deviation.
+  - Reviewer agent final result: no blocker/high findings; P01 can be approved with the Rust failure recorded as a verification deviation. Implementation commit: `accbae6`.
 - Verification tier used:
   - Tier 1 with deviation.
 - Deviations from planned verification:

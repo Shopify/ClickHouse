@@ -88,7 +88,7 @@ Next action:
 ## Handoff summary
 
 Current status:
-- P01 implementation is complete pending commit; reviewer approved with the unrelated Rust verification deviation recorded.
+- P01 implementation is complete in commit `accbae6`; reviewer approved with the unrelated Rust verification deviation recorded.
 
 Completed artifacts:
 - `src/IO/GCS/GCSStatus.*`: status, retry, exception-code mapping, and gRPC status conversion.
