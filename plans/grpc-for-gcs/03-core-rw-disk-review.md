@@ -25,7 +25,7 @@
   - `build/test_gcs_core_rw_disk_build.log`: Rust `wasmtime` build failure unrelated to GCS.
   - `build/test_gcs_core_rw_disk_objects.log`: `cmake` regeneration failure due uninitialized/missing `contrib` submodules.
   - `build/test_gcs_core_rw_disk_direct_objects.log`: direct compile blocked by missing `contrib`/toolchain/test include paths after the local environment failure.
-  - Reviewer-agent outputs in chat: initial blockers fixed; final relevant-path check blocked only on plan metadata before this review/task update.
+  - Reviewer-agent outputs in chat: initial blockers fixed; final relevant-path checks had no remaining blocker/high code findings. Implementation commit: `c1e2047`.
 - Verification tier used:
   - Tier 2 with deviation.
 - Deviations from planned verification:
@@ -67,4 +67,4 @@
 
 Reviewer: critic agent
 Status: approved
-Notes: Reviewer path used a dedicated critic agent with relevant tools. Initial critic reviews found blocker/high issues in write streaming, read range behavior, `start_after`, a compile parameter, live-RPC test behavior, and no-Google unused-parameter handling. Those were fixed. Final relevant-path checks found no remaining blocker/high code findings; remaining review findings are medium environment deviations and do not block phase completion.
+Notes: Implementation commit `c1e2047`.  Reviewer path used a dedicated critic agent with relevant tools. Initial critic reviews found blocker/high issues in write streaming, read range behavior, `start_after`, a compile parameter, live-RPC test behavior, and no-Google unused-parameter handling. Those were fixed. Final relevant-path checks found no remaining blocker/high code findings; remaining review findings are medium environment deviations and do not block phase completion.

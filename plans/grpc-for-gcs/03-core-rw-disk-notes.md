@@ -137,13 +137,13 @@ Next action:
 ## Handoff summary
 
 Current status:
-- P03 core native GCS implementation, fake coverage, review, and phase completion metadata are ready for commit, with build execution blocked by unrelated local `contrib`/Rust environment failures.
+- P03 core native GCS implementation, fake coverage, review, and phase completion are committed in `c1e2047`, with build execution blocked by unrelated local `contrib`/Rust environment failures.
 
 Completed artifacts:
 - `src/IO/GCS/GCSClient.*`: fake object map and captured write-stream requests for operation tests.
 - `src/Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.*`: native GCS core `IObjectStorage` read/write/list/delete/metadata/copy behavior for `local` metadata workloads.
 - `src/Disks/tests/gtest_gcs_object_storage_config.cpp`: fake core operation tests and local-metadata disk scenario.
-- `plans/grpc-for-gcs/03-core-rw-disk-review.md`: verification and critique record.
+- `plans/grpc-for-gcs/03-core-rw-disk-review.md`: verification and critique record committed with `c1e2047`.
 
 Key decisions:
 - Use direct `google.storage.v2` requests, `projects/_/buckets/<bucket>` resources, rewrite-only streaming writes, lazy ranged reads, generic buffered copy, and exclusive `start_after` filtering over GCS inclusive listing.
