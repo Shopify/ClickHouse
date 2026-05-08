@@ -8,6 +8,7 @@
 #    include <google/cloud/completion_queue.h>
 #    include <google/cloud/credentials.h>
 #    include <google/cloud/internal/unified_grpc_credentials.h>
+#    include <absl/strings/cord.h>
 #endif
 
 namespace DB::ErrorCodes
@@ -285,9 +286,15 @@ grpc::Status FakeReadStream::Finish()
     return finish_status;
 }
 
-FakeWriteStream::FakeWriteStream(google::storage::v2::WriteObjectResponse response_, grpc::Status finish_status_)
-    : response(std::move(response_))
+FakeWriteStream::FakeWriteStream(
+    google::storage::v2::WriteObjectResponse * response_out_,
+    google::storage::v2::WriteObjectResponse response_,
+    grpc::Status finish_status_,
+    FinishCallback finish_callback_)
+    : response_out(response_out_)
+    , response(std::move(response_))
     , finish_status(std::move(finish_status_))
+    , finish_callback(std::move(finish_callback_))
 {
 }
 
@@ -308,7 +315,38 @@ bool FakeWriteStream::WritesDone()
 
 grpc::Status FakeWriteStream::Finish()
 {
+    if (!finish_status.ok())
+        return finish_status;
+
+    if (finish_callback)
+    {
+        auto callback_status = finish_callback(writes, response);
+        if (!callback_status.ok())
+            return callback_status;
+    }
+
+    if (response_out)
+        *response_out = response;
+
     return finish_status;
+}
+
+
+namespace
+{
+
+std::string fakeObjectKey(const std::string & bucket, const std::string & object)
+{
+    return bucket + "\n" + object;
+}
+
+std::string cordToString(const absl::Cord & cord)
+{
+    std::string result;
+    absl::CopyCordToString(cord, &result);
+    return result;
+}
+
 }
 
 grpc::Status FakeStub::getObject(
@@ -319,6 +357,19 @@ grpc::Status FakeStub::getObject(
     last_deadline = context.deadline();
     last_metadata = context.GetServerInitialMetadata();
     get_object_requests.push_back(request);
+
+    if (!get_object_status.ok())
+        return get_object_status;
+
+    if (use_object_map)
+    {
+        auto it = objects.find(fakeObjectKey(request.bucket(), request.object()));
+        if (it == objects.end())
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "fake object not found");
+        response = it->second.metadata;
+        return grpc::Status::OK;
+    }
+
     response = get_object_response;
     return get_object_status;
 }
@@ -331,6 +382,32 @@ grpc::Status FakeStub::listObjects(
     last_deadline = context.deadline();
     last_metadata = context.GetServerInitialMetadata();
     list_objects_requests.push_back(request);
+
+    if (!list_objects_status.ok())
+        return list_objects_status;
+
+    if (use_object_map)
+    {
+        response.Clear();
+        size_t added = 0;
+        const size_t limit = request.page_size() > 0 ? static_cast<size_t>(request.page_size()) : std::numeric_limits<size_t>::max();
+        for (const auto & [key, object] : objects)
+        {
+            if (object.metadata.bucket() != request.parent())
+                continue;
+            if (!request.prefix().empty() && !object.metadata.name().starts_with(request.prefix()))
+                continue;
+            if (!request.lexicographic_start().empty() && object.metadata.name() < request.lexicographic_start())
+                continue;
+
+            *response.add_objects() = object.metadata;
+            ++added;
+            if (added >= limit)
+                break;
+        }
+        return grpc::Status::OK;
+    }
+
     response = list_objects_response;
     return list_objects_status;
 }
@@ -343,7 +420,19 @@ grpc::Status FakeStub::deleteObject(
     last_deadline = context.deadline();
     last_metadata = context.GetServerInitialMetadata();
     delete_object_requests.push_back(request);
-    return delete_object_status;
+
+    if (!delete_object_status.ok())
+        return delete_object_status;
+
+    if (use_object_map)
+    {
+        auto it = objects.find(fakeObjectKey(request.bucket(), request.object()));
+        if (it == objects.end())
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "fake object not found");
+        objects.erase(it);
+    }
+
+    return grpc::Status::OK;
 }
 
 std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>> FakeStub::readObject(
@@ -353,6 +442,31 @@ std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectRespo
     last_deadline = context.deadline();
     last_metadata = context.GetServerInitialMetadata();
     read_object_requests.push_back(request);
+
+    if (use_object_map)
+    {
+        auto it = objects.find(fakeObjectKey(request.bucket(), request.object()));
+        if (it == objects.end())
+            return std::make_unique<FakeReadStream>(
+                std::vector<google::storage::v2::ReadObjectResponse>{},
+                grpc::Status(grpc::StatusCode::NOT_FOUND, "fake object not found"));
+
+        const auto & data = it->second.data;
+        size_t offset = request.read_offset() > 0 ? static_cast<size_t>(request.read_offset()) : 0;
+        if (offset > data.size())
+            offset = data.size();
+        size_t size = data.size() - offset;
+        if (request.read_limit() > 0)
+            size = std::min(size, static_cast<size_t>(request.read_limit()));
+
+        google::storage::v2::ReadObjectResponse response;
+        *response.mutable_metadata() = it->second.metadata;
+        response.mutable_checksummed_data()->set_content(std::string_view(data).substr(offset, size));
+        return std::make_unique<FakeReadStream>(
+            std::vector<google::storage::v2::ReadObjectResponse>{response},
+            grpc::Status::OK);
+    }
+
     return std::make_unique<FakeReadStream>(read_object_responses, read_object_finish_status);
 }
 
@@ -363,7 +477,35 @@ std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequ
     last_deadline = context.deadline();
     last_metadata = context.GetServerInitialMetadata();
     response = write_object_response;
-    return std::make_unique<FakeWriteStream>(write_object_response, write_object_finish_status);
+
+    auto finish_callback = [this](const std::vector<google::storage::v2::WriteObjectRequest> & writes, google::storage::v2::WriteObjectResponse & write_response)
+    {
+        write_object_requests.insert(write_object_requests.end(), writes.begin(), writes.end());
+
+        if (!use_object_map)
+            return grpc::Status::OK;
+
+        if (writes.empty() || !writes.front().has_write_object_spec())
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "missing fake write object spec");
+
+        const auto & resource = writes.front().write_object_spec().resource();
+        std::string data;
+        for (const auto & write : writes)
+        {
+            if (write.has_checksummed_data())
+                data += cordToString(write.checksummed_data().content());
+        }
+
+        FakeObject object;
+        object.data = std::move(data);
+        object.metadata = resource;
+        object.metadata.set_size(static_cast<int64_t>(object.data.size()));
+        objects[fakeObjectKey(resource.bucket(), resource.name())] = object;
+        *write_response.mutable_resource() = object.metadata;
+        return grpc::Status::OK;
+    };
+
+    return std::make_unique<FakeWriteStream>(&response, write_object_response, write_object_finish_status, std::move(finish_callback));
 }
 
 #endif
