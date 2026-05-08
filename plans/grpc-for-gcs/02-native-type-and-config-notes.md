@@ -79,7 +79,7 @@ Next action:
 ## Handoff summary
 
 Current status:
-- P02 implementation, verification, and review are complete; phase completion is ready to commit.
+- P02 implementation, verification, review, and phase completion are complete in commit `8884e48`.
 
 Completed artifacts:
 - `src/Disks/DiskType.*`: native GCS identity and name.

@@ -57,4 +57,4 @@
 
 Reviewer: critic agent
 Status: approved
-Notes: Reviewer initially found a CMake source-list blocker where `CachedObjectStorage` was replaced by `GCSObjectStorage`; it was fixed. Final re-review found no blocker/high findings and approved P02 with the unrelated Rust build failure recorded as a verification deviation.
+Notes: Implementation commit `8884e48`. Reviewer initially found a CMake source-list blocker where `CachedObjectStorage` was replaced by `GCSObjectStorage`; it was fixed. Final re-review found no blocker/high findings and approved P02 with the unrelated Rust build failure recorded as a verification deviation.
