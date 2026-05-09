@@ -8,6 +8,7 @@
 #    include <google/cloud/completion_queue.h>
 #    include <google/cloud/credentials.h>
 #    include <google/cloud/internal/unified_grpc_credentials.h>
+#    include <google/cloud/internal/url_encode.h>
 #    include <absl/strings/cord.h>
 #endif
 
@@ -151,6 +152,11 @@ std::shared_ptr<google::cloud::Credentials> makeCredentials(const ClientSettings
     }
 }
 
+std::string bucketRoutingParameter(const std::string & bucket)
+{
+    return "bucket=" + google::cloud::internal::UrlEncode(bucket);
+}
+
 }
 
 Client::Client(
@@ -163,10 +169,13 @@ Client::Client(
 {
 }
 
-std::unique_ptr<grpc::ClientContext> Client::makeContext(Status & status) const
+std::unique_ptr<grpc::ClientContext> Client::makeContext(Status & status, const std::string & request_params) const
 {
     auto context = std::make_unique<grpc::ClientContext>();
     context->set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(settings.request_timeout_ms));
+
+    if (!request_params.empty())
+        context->AddMetadata("x-goog-request-params", request_params);
 
     if (!settings.user_project.empty())
         context->AddMetadata("x-goog-user-project", settings.user_project);
@@ -181,7 +190,7 @@ std::unique_ptr<grpc::ClientContext> Client::makeContext(Status & status) const
 Result<google::storage::v2::Object> Client::getObject(const google::storage::v2::GetObjectRequest & request) const
 {
     Result<google::storage::v2::Object> result;
-    auto context = makeContext(result.status);
+    auto context = makeContext(result.status, bucketRoutingParameter(request.bucket()));
     if (!result.ok())
         return result;
 
@@ -192,7 +201,7 @@ Result<google::storage::v2::Object> Client::getObject(const google::storage::v2:
 Result<google::storage::v2::ListObjectsResponse> Client::listObjects(const google::storage::v2::ListObjectsRequest & request) const
 {
     Result<google::storage::v2::ListObjectsResponse> result;
-    auto context = makeContext(result.status);
+    auto context = makeContext(result.status, bucketRoutingParameter(request.parent()));
     if (!result.ok())
         return result;
 
@@ -203,7 +212,7 @@ Result<google::storage::v2::ListObjectsResponse> Client::listObjects(const googl
 Status Client::deleteObject(const google::storage::v2::DeleteObjectRequest & request) const
 {
     Status status;
-    auto context = makeContext(status);
+    auto context = makeContext(status, bucketRoutingParameter(request.bucket()));
     if (!status.ok())
         return status;
 
@@ -215,7 +224,7 @@ StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse
     const google::storage::v2::ReadObjectRequest & request) const
 {
     StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>> result;
-    result.context = makeContext(result.status);
+    result.context = makeContext(result.status, bucketRoutingParameter(request.bucket()));
     if (!result.status.ok())
         return result;
 
@@ -226,10 +235,11 @@ StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse
 }
 
 StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> Client::writeObject(
-    google::storage::v2::WriteObjectResponse & response) const
+    google::storage::v2::WriteObjectResponse & response,
+    const std::string & bucket) const
 {
     StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> result;
-    result.context = makeContext(result.status);
+    result.context = makeContext(result.status, bucketRoutingParameter(bucket));
     if (!result.status.ok())
         return result;
 

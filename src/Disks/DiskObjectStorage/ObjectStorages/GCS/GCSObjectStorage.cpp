@@ -151,6 +151,7 @@ public:
     }
 
     std::optional<size_t> getRemoteFileSize() const override { return file_size; }
+    size_t getFileOffsetOfBufferEnd() const override { return read_offset; }
 
 private:
     size_t available() const
@@ -251,7 +252,7 @@ private:
             return;
 
         response.emplace();
-        stream_result.emplace(client->writeObject(*response));
+        stream_result.emplace(client->writeObject(*response, bucketResourceName(bucket)));
         GCS::throwIfError(stream_result->status, "starting WriteObject");
     }
 
@@ -285,7 +286,7 @@ private:
                 request.mutable_checksummed_data()->set_content(std::string_view(source + sent, chunk_size));
 
             if (!stream_result->stream->Write(request, grpc::WriteOptions{}))
-                throw Exception(ErrorCodes::S3_ERROR, "GCS gRPC WriteObject failed while sending object '{}'", object_name);
+                throwWriteFailure("sending");
 
             write_offset += chunk_size;
             sent += chunk_size;
@@ -297,13 +298,41 @@ private:
 
     void finishStream()
     {
+        if (stream_finished)
+            return;
+
         if (!stream_result)
             sendChunks(nullptr, 0, /* finish */ true);
 
         if (!stream_result->stream->WritesDone())
-            throw Exception(ErrorCodes::S3_ERROR, "GCS gRPC WriteObject failed while finishing writes for object '{}'", object_name);
+            throwWriteFailure("finishing writes for");
 
+        stream_finished = true;
         GCS::throwIfError(GCS::fromGrpcStatus(stream_result->stream->Finish()), "WriteObject");
+    }
+
+    [[noreturn]] void throwWriteFailure(std::string_view action)
+    {
+        stream_finished = true;
+        auto status = GCS::fromGrpcStatus(stream_result->stream->Finish());
+        if (!status.ok())
+        {
+            throw Exception(
+                GCS::errorCodeForStatus(status.code),
+                "GCS gRPC WriteObject failed while {} object '{}' at offset {} with {}: {}",
+                action,
+                object_name,
+                write_offset,
+                GCS::statusCodeName(status.code),
+                status.message);
+        }
+
+        throw Exception(
+            ErrorCodes::S3_ERROR,
+            "GCS gRPC WriteObject stream closed while {} object '{}' at offset {} without a final gRPC error status",
+            action,
+            object_name,
+            write_offset);
     }
 
     std::shared_ptr<GCS::Client> client;
@@ -313,6 +342,7 @@ private:
     std::optional<google::storage::v2::WriteObjectResponse> response;
     std::optional<GCS::StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>>> stream_result;
     bool started = false;
+    bool stream_finished = false;
     int64_t write_offset = 0;
 };
 
