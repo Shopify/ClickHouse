@@ -2,13 +2,17 @@
 
 #include <Common/Exception.h>
 
+#include <algorithm>
 #include <limits>
-
+#include <string>
+#include <string_view>
+#include <vector>
 #if USE_GOOGLE_CLOUD
 #    include <google/cloud/completion_queue.h>
 #    include <google/cloud/credentials.h>
 #    include <google/cloud/internal/unified_grpc_credentials.h>
 #    include <google/cloud/internal/url_encode.h>
+#    include <grpcpp/test/client_context_test_peer.h>
 #    include <absl/strings/cord.h>
 #endif
 
@@ -300,17 +304,23 @@ FakeWriteStream::FakeWriteStream(
     google::storage::v2::WriteObjectResponse * response_out_,
     google::storage::v2::WriteObjectResponse response_,
     grpc::Status finish_status_,
-    FinishCallback finish_callback_)
+    FinishCallback finish_callback_,
+    bool write_returns_false_,
+    bool writes_done_returns_false_,
+    int * finish_calls_)
     : response_out(response_out_)
     , response(std::move(response_))
     , finish_status(std::move(finish_status_))
     , finish_callback(std::move(finish_callback_))
+    , write_returns_false(write_returns_false_)
+    , writes_done_returns_false(writes_done_returns_false_)
+    , finish_calls(finish_calls_)
 {
 }
 
 bool FakeWriteStream::Write(const google::storage::v2::WriteObjectRequest & message, grpc::WriteOptions)
 {
-    if (writes_done)
+    if (writes_done || write_returns_false)
         return false;
 
     writes.push_back(message);
@@ -320,14 +330,16 @@ bool FakeWriteStream::Write(const google::storage::v2::WriteObjectRequest & mess
 bool FakeWriteStream::WritesDone()
 {
     writes_done = true;
-    return true;
+    return !writes_done_returns_false;
 }
 
 grpc::Status FakeWriteStream::Finish()
 {
+    if (finish_calls)
+        ++*finish_calls;
+
     if (!finish_status.ok())
         return finish_status;
-
     if (finish_callback)
     {
         auto callback_status = finish_callback(writes, response);
@@ -365,7 +377,7 @@ grpc::Status FakeStub::getObject(
     google::storage::v2::Object & response)
 {
     last_deadline = context.deadline();
-    last_metadata = context.GetServerInitialMetadata();
+    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     get_object_requests.push_back(request);
 
     if (!get_object_status.ok())
@@ -390,7 +402,7 @@ grpc::Status FakeStub::listObjects(
     google::storage::v2::ListObjectsResponse & response)
 {
     last_deadline = context.deadline();
-    last_metadata = context.GetServerInitialMetadata();
+    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     list_objects_requests.push_back(request);
 
     if (!list_objects_status.ok())
@@ -398,23 +410,28 @@ grpc::Status FakeStub::listObjects(
 
     if (use_object_map)
     {
-        response.Clear();
-        size_t added = 0;
-        const size_t limit = request.page_size() > 0 ? static_cast<size_t>(request.page_size()) : std::numeric_limits<size_t>::max();
+        std::vector<const google::storage::v2::Object *> matched;
         for (const auto & [key, object] : objects)
         {
+            (void)key;
             if (object.metadata.bucket() != request.parent())
                 continue;
             if (!request.prefix().empty() && !object.metadata.name().starts_with(request.prefix()))
                 continue;
             if (!request.lexicographic_start().empty() && object.metadata.name() < request.lexicographic_start())
                 continue;
-
-            *response.add_objects() = object.metadata;
-            ++added;
-            if (added >= limit)
-                break;
+            matched.push_back(&object.metadata);
         }
+
+        const size_t start = request.page_token().empty() ? 0 : std::stoull(request.page_token());
+        const size_t limit = request.page_size() > 0 ? static_cast<size_t>(request.page_size()) : std::numeric_limits<size_t>::max();
+        for (size_t i = start; i < matched.size() && static_cast<size_t>(response.objects_size()) < limit; ++i)
+            *response.add_objects() = *matched[i];
+
+        const size_t next = start + static_cast<size_t>(response.objects_size());
+        if (next < matched.size())
+            response.set_next_page_token(std::to_string(next));
+
         return grpc::Status::OK;
     }
 
@@ -428,7 +445,7 @@ grpc::Status FakeStub::deleteObject(
     google::protobuf::Empty &)
 {
     last_deadline = context.deadline();
-    last_metadata = context.GetServerInitialMetadata();
+    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     delete_object_requests.push_back(request);
 
     if (!delete_object_status.ok())
@@ -450,7 +467,7 @@ std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectRespo
     const google::storage::v2::ReadObjectRequest & request)
 {
     last_deadline = context.deadline();
-    last_metadata = context.GetServerInitialMetadata();
+    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     read_object_requests.push_back(request);
 
     if (use_object_map)
@@ -485,7 +502,7 @@ std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequ
     google::storage::v2::WriteObjectResponse & response)
 {
     last_deadline = context.deadline();
-    last_metadata = context.GetServerInitialMetadata();
+    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     response = write_object_response;
 
     auto finish_callback = [this](const std::vector<google::storage::v2::WriteObjectRequest> & writes, google::storage::v2::WriteObjectResponse & write_response)
@@ -515,7 +532,14 @@ std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequ
         return grpc::Status::OK;
     };
 
-    return std::make_unique<FakeWriteStream>(&response, write_object_response, write_object_finish_status, std::move(finish_callback));
+    return std::make_unique<FakeWriteStream>(
+        &response,
+        write_object_response,
+        write_object_finish_status,
+        std::move(finish_callback),
+        write_object_write_returns_false,
+        write_object_writes_done_returns_false,
+        &write_object_finish_calls);
 }
 
 #endif

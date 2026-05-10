@@ -148,7 +148,10 @@ public:
         google::storage::v2::WriteObjectResponse * response_out_,
         google::storage::v2::WriteObjectResponse response_,
         grpc::Status finish_status_,
-        FinishCallback finish_callback_ = {});
+        FinishCallback finish_callback_ = {},
+        bool write_returns_false_ = false,
+        bool writes_done_returns_false_ = false,
+        int * finish_calls_ = nullptr);
 
     void WaitForInitialMetadata() {}
     bool Write(const google::storage::v2::WriteObjectRequest & message, grpc::WriteOptions options) override;
@@ -164,8 +167,10 @@ private:
     FinishCallback finish_callback;
     std::vector<google::storage::v2::WriteObjectRequest> writes;
     bool writes_done = false;
+    bool write_returns_false = false;
+    bool writes_done_returns_false = false;
+    int * finish_calls = nullptr;
 };
-
 class FakeStub final : public IStub
 {
 public:
@@ -184,6 +189,9 @@ public:
     grpc::Status read_object_finish_status;
     google::storage::v2::WriteObjectResponse write_object_response;
     grpc::Status write_object_finish_status;
+    bool write_object_write_returns_false = false;
+    bool write_object_writes_done_returns_false = false;
+    int write_object_finish_calls = 0;
     bool use_object_map = false;
     std::map<std::string, FakeObject> objects;
 
@@ -217,9 +225,8 @@ public:
         google::storage::v2::WriteObjectResponse & response) override;
 
     std::chrono::system_clock::time_point last_deadline;
-    std::multimap<grpc::string_ref, grpc::string_ref> last_metadata;
+    std::multimap<std::string, std::string> last_metadata;
 };
-
 #endif
 
 }

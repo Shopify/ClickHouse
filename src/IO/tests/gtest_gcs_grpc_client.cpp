@@ -4,6 +4,12 @@
 #include <Common/Exception.h>
 #include <gtest/gtest.h>
 
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
 namespace DB::ErrorCodes
 {
     extern const int ACCESS_DENIED;
@@ -58,6 +64,70 @@ TEST(GCSGrpcClientFoundation, AvailabilityGuard)
 }
 
 #if USE_GOOGLE_CLOUD
+namespace
+{
+
+std::vector<std::string> metadataValues(const std::multimap<std::string, std::string> & metadata, const std::string & key)
+{
+    std::vector<std::string> values;
+    auto range = metadata.equal_range(key);
+    for (auto it = range.first; it != range.second; ++it)
+        values.push_back(it->second);
+    return values;
+}
+
+void expectSingleMetadata(const std::multimap<std::string, std::string> & metadata, const std::string & key, const std::string & value)
+{
+    auto values = metadataValues(metadata, key);
+    ASSERT_EQ(1, values.size());
+    EXPECT_EQ(value, values.front());
+}
+
+class FailingAuth final : public google::cloud::internal::GrpcAuthenticationStrategy
+{
+public:
+    explicit FailingAuth(google::cloud::Status failure_)
+        : failure(std::move(failure_))
+    {
+    }
+
+    std::shared_ptr<grpc::Channel> CreateChannel(std::string const &, grpc::ChannelArguments const &) override
+    {
+        return grpc::CreateChannel("localhost", grpc::InsecureChannelCredentials());
+    }
+
+    bool RequiresConfigureContext() const override
+    {
+        return true;
+    }
+
+    google::cloud::Status ConfigureContext(grpc::ClientContext &) override
+    {
+        return failure;
+    }
+
+    google::cloud::future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>> AsyncConfigureContext(
+        std::shared_ptr<grpc::ClientContext>) override
+    {
+        return google::cloud::make_ready_future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>>(failure);
+    }
+
+private:
+    google::cloud::Status failure;
+};
+
+}
+
+TEST(GCSGrpcClientFoundation, GrpcStatusIncludesDetailsAndNumericCode)
+{
+    auto status = GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "denied", "quota project missing"));
+
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, status.code);
+    EXPECT_NE(std::string::npos, status.message.find("denied"));
+    EXPECT_NE(std::string::npos, status.message.find("details: quota project missing"));
+    EXPECT_NE(std::string::npos, status.message.find("grpc_status_code: 7"));
+}
+
 TEST(GCSGrpcClientFoundation, GrpcStatusMapping)
 {
     EXPECT_TRUE(GCS::fromGrpcStatus(grpc::Status::OK).ok());
@@ -98,6 +168,85 @@ TEST(GCSGrpcClientFoundation, FakeUnaryRequests)
     ASSERT_EQ(1, fake_stub->get_object_requests.size());
     EXPECT_EQ("path", fake_stub->get_object_requests.front().object());
     EXPECT_GE(fake_stub->last_deadline, std::chrono::system_clock::now());
+}
+
+TEST(GCSGrpcClientFoundation, RoutingMetadataForUnaryRequests)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+
+    GCS::ClientSettings settings;
+    settings.user_project = "billing-project";
+    GCS::Client client(settings, fake_stub);
+
+    google::storage::v2::GetObjectRequest get_request;
+    get_request.set_bucket("projects/_/buckets/foo");
+    get_request.set_object("path");
+    ASSERT_TRUE(client.getObject(get_request).ok());
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-request-params", "bucket=projects%2F_%2Fbuckets%2Ffoo");
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-user-project", "billing-project");
+
+    google::storage::v2::ListObjectsRequest list_request;
+    list_request.set_parent("projects/_/buckets/foo");
+    ASSERT_TRUE(client.listObjects(list_request).ok());
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-request-params", "bucket=projects%2F_%2Fbuckets%2Ffoo");
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-user-project", "billing-project");
+
+    google::storage::v2::DeleteObjectRequest delete_request;
+    delete_request.set_bucket("projects/_/buckets/foo");
+    delete_request.set_object("path");
+    EXPECT_TRUE(client.deleteObject(delete_request).ok());
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-request-params", "bucket=projects%2F_%2Fbuckets%2Ffoo");
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-user-project", "billing-project");
+}
+
+TEST(GCSGrpcClientFoundation, RoutingMetadataForReadStream)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    GCS::Client client({}, fake_stub);
+
+    google::storage::v2::ReadObjectRequest request;
+    request.set_bucket("projects/_/buckets/foo");
+    request.set_object("path");
+
+    auto stream = client.readObject(request);
+    ASSERT_TRUE(stream.ok()) << stream.status.message;
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-request-params", "bucket=projects%2F_%2Fbuckets%2Ffoo");
+}
+
+TEST(GCSGrpcClientFoundation, RoutingMetadataForWriteStream)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    GCS::Client client({}, fake_stub);
+
+    google::storage::v2::WriteObjectResponse response;
+    auto stream = client.writeObject(response, "projects/_/buckets/foo");
+    ASSERT_TRUE(stream.ok()) << stream.status.message;
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-request-params", "bucket=projects%2F_%2Fbuckets%2Ffoo");
+    EXPECT_TRUE(stream.stream->WritesDone());
+    EXPECT_TRUE(stream.stream->Finish().ok());
+}
+
+TEST(GCSGrpcClientFoundation, AuthContextFailurePropagation)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto auth = std::make_shared<FailingAuth>(google::cloud::Status(google::cloud::StatusCode::kPermissionDenied, "auth denied"));
+    GCS::Client client({}, fake_stub, auth);
+
+    google::storage::v2::GetObjectRequest get_request;
+    get_request.set_bucket("projects/_/buckets/foo");
+    auto get_result = client.getObject(get_request);
+    EXPECT_FALSE(get_result.ok());
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, get_result.status.code);
+    EXPECT_NE(std::string::npos, get_result.status.message.find("auth denied"));
+    EXPECT_TRUE(fake_stub->get_object_requests.empty());
+
+    google::storage::v2::ReadObjectRequest read_request;
+    read_request.set_bucket("projects/_/buckets/foo");
+    auto read_result = client.readObject(read_request);
+    EXPECT_FALSE(read_result.ok());
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, read_result.status.code);
+    EXPECT_EQ(nullptr, read_result.stream.get());
+    EXPECT_TRUE(fake_stub->read_object_requests.empty());
 }
 
 TEST(GCSGrpcClientFoundation, FakeStatusFailure)
