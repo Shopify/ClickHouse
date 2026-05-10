@@ -141,7 +141,7 @@ TEST(GCSGrpcClientFoundation, FakeStreamingRequests)
     EXPECT_TRUE(read_stream.stream->Finish().ok());
 
     google::storage::v2::WriteObjectResponse write_response;
-    auto write_stream = client.writeObject(write_response);
+    auto write_stream = client.writeObject(write_response, "projects/_/buckets/test");
     ASSERT_TRUE(write_stream.ok()) << write_stream.status.message;
 
     google::storage::v2::WriteObjectRequest write_request;

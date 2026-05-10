@@ -108,12 +108,13 @@ public:
         const google::storage::v2::ReadObjectRequest & request) const;
 
     StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> writeObject(
-        google::storage::v2::WriteObjectResponse & response) const;
+        google::storage::v2::WriteObjectResponse & response,
+        const std::string & bucket) const;
 
     const ClientSettings & getSettings() const { return settings; }
 
 private:
-    std::unique_ptr<grpc::ClientContext> makeContext(Status & status) const;
+    std::unique_ptr<grpc::ClientContext> makeContext(Status & status, const std::string & request_params = {}) const;
 
     ClientSettings settings;
     std::shared_ptr<IStub> stub;
