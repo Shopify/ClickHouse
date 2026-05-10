@@ -6,6 +6,7 @@
 #include <config.h>
 
 #include <chrono>
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -140,7 +141,13 @@ private:
 class FakeWriteStream final : public grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>
 {
 public:
-    FakeWriteStream(google::storage::v2::WriteObjectResponse response_, grpc::Status finish_status_);
+    using FinishCallback = std::function<grpc::Status(const std::vector<google::storage::v2::WriteObjectRequest> &, google::storage::v2::WriteObjectResponse &)>;
+
+    FakeWriteStream(
+        google::storage::v2::WriteObjectResponse * response_out_,
+        google::storage::v2::WriteObjectResponse response_,
+        grpc::Status finish_status_,
+        FinishCallback finish_callback_ = {});
 
     void WaitForInitialMetadata() {}
     bool Write(const google::storage::v2::WriteObjectRequest & message, grpc::WriteOptions options) override;
@@ -150,8 +157,10 @@ public:
     const std::vector<google::storage::v2::WriteObjectRequest> & getWrites() const { return writes; }
 
 private:
+    google::storage::v2::WriteObjectResponse * response_out;
     google::storage::v2::WriteObjectResponse response;
     grpc::Status finish_status;
+    FinishCallback finish_callback;
     std::vector<google::storage::v2::WriteObjectRequest> writes;
     bool writes_done = false;
 };
@@ -159,6 +168,12 @@ private:
 class FakeStub final : public IStub
 {
 public:
+    struct FakeObject
+    {
+        std::string data;
+        google::storage::v2::Object metadata;
+    };
+
     grpc::Status get_object_status;
     google::storage::v2::Object get_object_response;
     grpc::Status list_objects_status;
@@ -168,11 +183,14 @@ public:
     grpc::Status read_object_finish_status;
     google::storage::v2::WriteObjectResponse write_object_response;
     grpc::Status write_object_finish_status;
+    bool use_object_map = false;
+    std::map<std::string, FakeObject> objects;
 
     std::vector<google::storage::v2::GetObjectRequest> get_object_requests;
     std::vector<google::storage::v2::ListObjectsRequest> list_objects_requests;
     std::vector<google::storage::v2::DeleteObjectRequest> delete_object_requests;
     std::vector<google::storage::v2::ReadObjectRequest> read_object_requests;
+    std::vector<google::storage::v2::WriteObjectRequest> write_object_requests;
 
     grpc::Status getObject(
         grpc::ClientContext & context,

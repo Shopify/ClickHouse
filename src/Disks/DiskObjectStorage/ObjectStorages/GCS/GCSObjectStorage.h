@@ -57,6 +57,13 @@ public:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings,
         std::optional<ObjectAttributes> object_to_attributes = {}) override;
+    void copyObjectToAnotherObjectStorage(
+        const StoredObject & object_from,
+        const StoredObject & object_to,
+        const ReadSettings & read_settings,
+        const WriteSettings & write_settings,
+        IObjectStorage & object_storage_to,
+        std::optional<ObjectAttributes> object_to_attributes = {}) override;
     ObjectMetadata getObjectMetadata(const std::string & path, bool with_tags) const override;
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
     void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const override;
@@ -68,6 +75,9 @@ public:
 
     void shutdown() override {}
     void startup() override {}
+    bool supportParallelWrite() const override { return false; }
+    ReadSettings patchSettings(const ReadSettings & read_settings) const override;
+    WriteSettings patchSettings(const WriteSettings & write_settings) const override;
 
     ObjectStorageKeyGeneratorPtr createKeyGenerator() const override;
 
