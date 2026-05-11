@@ -8,17 +8,17 @@
 #include <string_view>
 #include <vector>
 #if USE_GOOGLE_CLOUD
+#    include <absl/strings/cord.h>
 #    include <google/cloud/completion_queue.h>
 #    include <google/cloud/credentials.h>
 #    include <google/cloud/internal/unified_grpc_credentials.h>
 #    include <google/cloud/internal/url_encode.h>
 #    include <grpcpp/test/client_context_test_peer.h>
-#    include <absl/strings/cord.h>
 #endif
 
 namespace DB::ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
+extern const int NOT_IMPLEMENTED;
 }
 
 namespace DB::GCS
@@ -79,8 +79,9 @@ Status fromCloudStatus(const google::cloud::Status & status)
             return makeStatus(StatusCode::PermissionDenied, status.message());
         case google::cloud::StatusCode::kDeadlineExceeded:
             return makeStatus(StatusCode::DeadlineExceeded, status.message());
-        case google::cloud::StatusCode::kUnavailable:
         case google::cloud::StatusCode::kResourceExhausted:
+            return makeStatus(StatusCode::ResourceExhausted, status.message());
+        case google::cloud::StatusCode::kUnavailable:
             return makeStatus(StatusCode::Unavailable, status.message());
         case google::cloud::StatusCode::kInvalidArgument:
         case google::cloud::StatusCode::kFailedPrecondition:
@@ -125,16 +126,14 @@ public:
         return stub->DeleteObject(&context, request, &response);
     }
 
-    std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>> readObject(
-        grpc::ClientContext & context,
-        const google::storage::v2::ReadObjectRequest & request) override
+    std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>>
+    readObject(grpc::ClientContext & context, const google::storage::v2::ReadObjectRequest & request) override
     {
         return stub->ReadObject(&context, request);
     }
 
-    std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> writeObject(
-        grpc::ClientContext & context,
-        google::storage::v2::WriteObjectResponse & response) override
+    std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>>
+    writeObject(grpc::ClientContext & context, google::storage::v2::WriteObjectResponse & response) override
     {
         return stub->WriteObject(&context, &response);
     }
@@ -164,9 +163,7 @@ std::string bucketRoutingParameter(const std::string & bucket)
 }
 
 Client::Client(
-    ClientSettings settings_,
-    std::shared_ptr<IStub> stub_,
-    std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth_)
+    ClientSettings settings_, std::shared_ptr<IStub> stub_, std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth_)
     : settings(std::move(settings_))
     , stub(std::move(stub_))
     , auth(std::move(auth_))
@@ -224,8 +221,8 @@ Status Client::deleteObject(const google::storage::v2::DeleteObjectRequest & req
     return fromGrpcStatus(stub->deleteObject(*context, request, response));
 }
 
-StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>> Client::readObject(
-    const google::storage::v2::ReadObjectRequest & request) const
+StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>>
+Client::readObject(const google::storage::v2::ReadObjectRequest & request) const
 {
     StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>> result;
     result.context = makeContext(result.status, bucketRoutingParameter(request.bucket()));
@@ -238,9 +235,8 @@ StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse
     return result;
 }
 
-StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> Client::writeObject(
-    google::storage::v2::WriteObjectResponse & response,
-    const std::string & bucket) const
+StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>>
+Client::writeObject(google::storage::v2::WriteObjectResponse & response, const std::string & bucket) const
 {
     StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> result;
     result.context = makeContext(result.status, bucketRoutingParameter(bucket));
@@ -280,9 +276,8 @@ bool FakeReadStream::NextMessageSize(uint32_t * size)
     }
 
     const auto response_size = responses[next_response].ByteSizeLong();
-    *size = response_size > std::numeric_limits<uint32_t>::max()
-        ? std::numeric_limits<uint32_t>::max()
-        : static_cast<uint32_t>(response_size);
+    *size = response_size > std::numeric_limits<uint32_t>::max() ? std::numeric_limits<uint32_t>::max()
+                                                                 : static_cast<uint32_t>(response_size);
     return true;
 }
 
@@ -372,9 +367,7 @@ std::string cordToString(const absl::Cord & cord)
 }
 
 grpc::Status FakeStub::getObject(
-    grpc::ClientContext & context,
-    const google::storage::v2::GetObjectRequest & request,
-    google::storage::v2::Object & response)
+    grpc::ClientContext & context, const google::storage::v2::GetObjectRequest & request, google::storage::v2::Object & response)
 {
     last_deadline = context.deadline();
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
@@ -439,10 +432,8 @@ grpc::Status FakeStub::listObjects(
     return list_objects_status;
 }
 
-grpc::Status FakeStub::deleteObject(
-    grpc::ClientContext & context,
-    const google::storage::v2::DeleteObjectRequest & request,
-    google::protobuf::Empty &)
+grpc::Status
+FakeStub::deleteObject(grpc::ClientContext & context, const google::storage::v2::DeleteObjectRequest & request, google::protobuf::Empty &)
 {
     last_deadline = context.deadline();
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
@@ -462,9 +453,8 @@ grpc::Status FakeStub::deleteObject(
     return grpc::Status::OK;
 }
 
-std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>> FakeStub::readObject(
-    grpc::ClientContext & context,
-    const google::storage::v2::ReadObjectRequest & request)
+std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>>
+FakeStub::readObject(grpc::ClientContext & context, const google::storage::v2::ReadObjectRequest & request)
 {
     last_deadline = context.deadline();
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
@@ -475,8 +465,7 @@ std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectRespo
         auto it = objects.find(fakeObjectKey(request.bucket(), request.object()));
         if (it == objects.end())
             return std::make_unique<FakeReadStream>(
-                std::vector<google::storage::v2::ReadObjectResponse>{},
-                grpc::Status(grpc::StatusCode::NOT_FOUND, "fake object not found"));
+                std::vector<google::storage::v2::ReadObjectResponse>{}, grpc::Status(grpc::StatusCode::NOT_FOUND, "fake object not found"));
 
         const auto & data = it->second.data;
         size_t offset = request.read_offset() > 0 ? static_cast<size_t>(request.read_offset()) : 0;
@@ -489,23 +478,22 @@ std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectRespo
         google::storage::v2::ReadObjectResponse response;
         *response.mutable_metadata() = it->second.metadata;
         response.mutable_checksummed_data()->set_content(std::string_view(data).substr(offset, size));
-        return std::make_unique<FakeReadStream>(
-            std::vector<google::storage::v2::ReadObjectResponse>{response},
-            grpc::Status::OK);
+        return std::make_unique<FakeReadStream>(std::vector<google::storage::v2::ReadObjectResponse>{response}, grpc::Status::OK);
     }
 
     return std::make_unique<FakeReadStream>(read_object_responses, read_object_finish_status);
 }
 
-std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> FakeStub::writeObject(
-    grpc::ClientContext & context,
-    google::storage::v2::WriteObjectResponse & response)
+std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>>
+FakeStub::writeObject(grpc::ClientContext & context, google::storage::v2::WriteObjectResponse & response)
 {
     last_deadline = context.deadline();
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     response = write_object_response;
 
-    auto finish_callback = [this](const std::vector<google::storage::v2::WriteObjectRequest> & writes, google::storage::v2::WriteObjectResponse & write_response)
+    auto finish_callback =
+        [this](
+            const std::vector<google::storage::v2::WriteObjectRequest> & writes, google::storage::v2::WriteObjectResponse & write_response)
     {
         write_object_requests.insert(write_object_requests.end(), writes.begin(), writes.end());
 

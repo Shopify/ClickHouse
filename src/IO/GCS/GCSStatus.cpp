@@ -6,13 +6,13 @@
 
 namespace DB::ErrorCodes
 {
-    extern const int ACCESS_DENIED;
-    extern const int BAD_ARGUMENTS;
-    extern const int FILE_DOESNT_EXIST;
-    extern const int NETWORK_ERROR;
-    extern const int NOT_IMPLEMENTED;
-    extern const int S3_ERROR;
-    extern const int TIMEOUT_EXCEEDED;
+extern const int ACCESS_DENIED;
+extern const int BAD_ARGUMENTS;
+extern const int FILE_DOESNT_EXIST;
+extern const int NETWORK_ERROR;
+extern const int NOT_IMPLEMENTED;
+extern const int S3_ERROR;
+extern const int TIMEOUT_EXCEEDED;
 }
 
 namespace DB::GCS
@@ -35,6 +35,8 @@ const char * statusCodeName(StatusCode code)
             return "PermissionDenied";
         case StatusCode::DeadlineExceeded:
             return "DeadlineExceeded";
+        case StatusCode::ResourceExhausted:
+            return "ResourceExhausted";
         case StatusCode::Unavailable:
             return "Unavailable";
         case StatusCode::InvalidArgument:
@@ -48,7 +50,12 @@ const char * statusCodeName(StatusCode code)
 
 bool isRetryableStatus(StatusCode code)
 {
-    return code == StatusCode::Unavailable || code == StatusCode::DeadlineExceeded;
+    return code == StatusCode::ResourceExhausted || code == StatusCode::Unavailable || code == StatusCode::DeadlineExceeded;
+}
+
+bool isThrottlingStatus(StatusCode code)
+{
+    return code == StatusCode::ResourceExhausted;
 }
 
 int errorCodeForStatus(StatusCode code)
@@ -63,6 +70,7 @@ int errorCodeForStatus(StatusCode code)
             return ErrorCodes::ACCESS_DENIED;
         case StatusCode::DeadlineExceeded:
             return ErrorCodes::TIMEOUT_EXCEEDED;
+        case StatusCode::ResourceExhausted:
         case StatusCode::Unavailable:
             return ErrorCodes::NETWORK_ERROR;
         case StatusCode::InvalidArgument:
@@ -79,7 +87,8 @@ void throwIfError(const Status & status, const String & operation)
     if (status.ok())
         return;
 
-    throw Exception(errorCodeForStatus(status.code), "GCS gRPC {} failed with {}: {}", operation, statusCodeName(status.code), status.message);
+    throw Exception(
+        errorCodeForStatus(status.code), "GCS gRPC {} failed with {}: {}", operation, statusCodeName(status.code), status.message);
 }
 
 #if USE_GOOGLE_CLOUD
@@ -102,8 +111,9 @@ Status fromGrpcStatus(const grpc::Status & status)
             return makeStatus(StatusCode::PermissionDenied, std::move(message));
         case grpc::StatusCode::DEADLINE_EXCEEDED:
             return makeStatus(StatusCode::DeadlineExceeded, std::move(message));
-        case grpc::StatusCode::UNAVAILABLE:
         case grpc::StatusCode::RESOURCE_EXHAUSTED:
+            return makeStatus(StatusCode::ResourceExhausted, std::move(message));
+        case grpc::StatusCode::UNAVAILABLE:
             return makeStatus(StatusCode::Unavailable, std::move(message));
         case grpc::StatusCode::INVALID_ARGUMENT:
         case grpc::StatusCode::FAILED_PRECONDITION:

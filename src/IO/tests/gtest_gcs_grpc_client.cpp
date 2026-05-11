@@ -1,8 +1,8 @@
 #include <IO/GCS/GCSClient.h>
 #include <IO/GCS/GCSStatus.h>
 
-#include <Common/Exception.h>
 #include <gtest/gtest.h>
+#include <Common/Exception.h>
 
 #include <map>
 #include <memory>
@@ -12,12 +12,12 @@
 
 namespace DB::ErrorCodes
 {
-    extern const int ACCESS_DENIED;
-    extern const int BAD_ARGUMENTS;
-    extern const int FILE_DOESNT_EXIST;
-    extern const int NETWORK_ERROR;
-    extern const int NOT_IMPLEMENTED;
-    extern const int TIMEOUT_EXCEEDED;
+extern const int ACCESS_DENIED;
+extern const int BAD_ARGUMENTS;
+extern const int FILE_DOESNT_EXIST;
+extern const int NETWORK_ERROR;
+extern const int NOT_IMPLEMENTED;
+extern const int TIMEOUT_EXCEEDED;
 }
 
 using namespace DB;
@@ -43,13 +43,20 @@ TEST(GCSGrpcClientFoundation, ErrorCodeMapping)
     EXPECT_EQ(ErrorCodes::FILE_DOESNT_EXIST, GCS::errorCodeForStatus(GCS::StatusCode::NotFound));
     EXPECT_EQ(ErrorCodes::ACCESS_DENIED, GCS::errorCodeForStatus(GCS::StatusCode::PermissionDenied));
     EXPECT_EQ(ErrorCodes::TIMEOUT_EXCEEDED, GCS::errorCodeForStatus(GCS::StatusCode::DeadlineExceeded));
+    EXPECT_EQ(ErrorCodes::NETWORK_ERROR, GCS::errorCodeForStatus(GCS::StatusCode::ResourceExhausted));
     EXPECT_EQ(ErrorCodes::NETWORK_ERROR, GCS::errorCodeForStatus(GCS::StatusCode::Unavailable));
     EXPECT_EQ(ErrorCodes::BAD_ARGUMENTS, GCS::errorCodeForStatus(GCS::StatusCode::InvalidArgument));
     EXPECT_EQ(ErrorCodes::NOT_IMPLEMENTED, GCS::errorCodeForStatus(GCS::StatusCode::Unsupported));
 
+    EXPECT_TRUE(GCS::isRetryableStatus(GCS::StatusCode::ResourceExhausted));
     EXPECT_TRUE(GCS::isRetryableStatus(GCS::StatusCode::Unavailable));
     EXPECT_TRUE(GCS::isRetryableStatus(GCS::StatusCode::DeadlineExceeded));
     EXPECT_FALSE(GCS::isRetryableStatus(GCS::StatusCode::NotFound));
+
+    EXPECT_TRUE(GCS::isThrottlingStatus(GCS::StatusCode::ResourceExhausted));
+    EXPECT_FALSE(GCS::isThrottlingStatus(GCS::StatusCode::Unavailable));
+    EXPECT_FALSE(GCS::isThrottlingStatus(GCS::StatusCode::DeadlineExceeded));
+    EXPECT_FALSE(GCS::isThrottlingStatus(GCS::StatusCode::NotFound));
 }
 
 TEST(GCSGrpcClientFoundation, AvailabilityGuard)
@@ -96,18 +103,12 @@ public:
         return grpc::CreateChannel("localhost", grpc::InsecureChannelCredentials());
     }
 
-    bool RequiresConfigureContext() const override
-    {
-        return true;
-    }
+    bool RequiresConfigureContext() const override { return true; }
 
-    google::cloud::Status ConfigureContext(grpc::ClientContext &) override
-    {
-        return failure;
-    }
+    google::cloud::Status ConfigureContext(grpc::ClientContext &) override { return failure; }
 
-    google::cloud::future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>> AsyncConfigureContext(
-        std::shared_ptr<grpc::ClientContext>) override
+    google::cloud::future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>>
+    AsyncConfigureContext(std::shared_ptr<grpc::ClientContext>) override
     {
         return google::cloud::make_ready_future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>>(failure);
     }
@@ -132,19 +133,15 @@ TEST(GCSGrpcClientFoundation, GrpcStatusMapping)
 {
     EXPECT_TRUE(GCS::fromGrpcStatus(grpc::Status::OK).ok());
     EXPECT_EQ(GCS::StatusCode::NotFound, GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::NOT_FOUND, "missing")).code);
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "denied")).code);
     EXPECT_EQ(
-        GCS::StatusCode::PermissionDenied,
-        GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "denied")).code);
-    EXPECT_EQ(
-        GCS::StatusCode::PermissionDenied,
-        GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "unauthenticated")).code);
-    EXPECT_EQ(
-        GCS::StatusCode::DeadlineExceeded,
-        GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "deadline")).code);
+        GCS::StatusCode::PermissionDenied, GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "unauthenticated")).code);
+    EXPECT_EQ(GCS::StatusCode::DeadlineExceeded, GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "deadline")).code);
     EXPECT_EQ(GCS::StatusCode::Unavailable, GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::UNAVAILABLE, "unavailable")).code);
     EXPECT_EQ(
-        GCS::StatusCode::Unsupported,
-        GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "unsupported")).code);
+        GCS::StatusCode::ResourceExhausted,
+        GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "resource exhausted")).code);
+    EXPECT_EQ(GCS::StatusCode::Unsupported, GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "unsupported")).code);
 }
 
 TEST(GCSGrpcClientFoundation, FakeUnaryRequests)
