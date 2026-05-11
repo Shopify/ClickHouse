@@ -39,10 +39,8 @@ public:
     String getObjectsNamespace() const override { return settings.bucket; }
 
     bool exists(const StoredObject & object) const override;
-    std::unique_ptr<ReadBufferFromFileBase> readObject(
-        const StoredObject & object,
-        const ReadSettings & read_settings,
-        std::optional<size_t> read_hint = {}) const override;
+    std::unique_ptr<ReadBufferFromFileBase>
+    readObject(const StoredObject & object, const ReadSettings & read_settings, std::optional<size_t> read_hint = {}) const override;
     std::unique_ptr<WriteBufferFromFileBase> writeObject(
         const StoredObject & object,
         WriteMode mode,
@@ -68,13 +66,10 @@ public:
     std::optional<ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override;
     void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const override;
     ObjectStorageIteratorPtr iterate(
-        const std::string & path_prefix,
-        size_t max_keys,
-        bool with_tags,
-        const std::optional<std::string> & start_after) const override;
+        const std::string & path_prefix, size_t max_keys, bool with_tags, const std::optional<std::string> & start_after) const override;
 
-    void shutdown() override {}
-    void startup() override {}
+    void shutdown() override { }
+    void startup() override { }
     bool supportParallelWrite() const override { return false; }
     ReadSettings patchSettings(const ReadSettings & read_settings) const override;
     WriteSettings patchSettings(const WriteSettings & write_settings) const override;

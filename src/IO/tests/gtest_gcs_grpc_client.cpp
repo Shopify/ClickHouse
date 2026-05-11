@@ -2,7 +2,10 @@
 #include <IO/GCS/GCSStatus.h>
 
 #include <gtest/gtest.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/Throttler.h>
 
 #include <map>
 #include <memory>
@@ -18,6 +21,37 @@ extern const int FILE_DOESNT_EXIST;
 extern const int NETWORK_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int TIMEOUT_EXCEEDED;
+}
+
+namespace ProfileEvents
+{
+extern const Event GCSGetObject;
+extern const Event GCSListObjects;
+extern const Event GCSDeleteObject;
+extern const Event GCSReadObject;
+extern const Event GCSWriteObject;
+extern const Event GCSReadRequestsCount;
+extern const Event GCSReadRequestsErrors;
+extern const Event GCSReadRequestsThrottling;
+extern const Event GCSReadRequestAttempts;
+extern const Event GCSReadRequestRetryableErrors;
+extern const Event GCSWriteRequestsCount;
+extern const Event GCSWriteRequestsErrors;
+extern const Event GCSWriteRequestsThrottling;
+extern const Event GCSWriteRequestAttempts;
+extern const Event GCSWriteRequestRetryableErrors;
+extern const Event GCSGetRequestThrottlerCount;
+extern const Event GCSGetRequestThrottlerBlocked;
+extern const Event GCSGetRequestThrottlerSleepMicroseconds;
+extern const Event GCSPutRequestThrottlerCount;
+extern const Event GCSPutRequestThrottlerBlocked;
+extern const Event GCSPutRequestThrottlerSleepMicroseconds;
+extern const Event DiskGCSGetRequestThrottlerCount;
+extern const Event DiskGCSGetRequestThrottlerBlocked;
+extern const Event DiskGCSGetRequestThrottlerSleepMicroseconds;
+extern const Event DiskGCSPutRequestThrottlerCount;
+extern const Event DiskGCSPutRequestThrottlerBlocked;
+extern const Event DiskGCSPutRequestThrottlerSleepMicroseconds;
 }
 
 using namespace DB;
@@ -88,6 +122,21 @@ void expectSingleMetadata(const std::multimap<std::string, std::string> & metada
     auto values = metadataValues(metadata, key);
     ASSERT_EQ(1, values.size());
     EXPECT_EQ(value, values.front());
+}
+
+UInt64 profileEventValue(ProfileEvents::Event event)
+{
+    return CurrentThread::getProfileEvents()[event];
+}
+
+void resetProfileEvents()
+{
+    CurrentThread::getProfileEvents().reset();
+}
+
+std::shared_ptr<Throttler> blockingRequestThrottler(ProfileEvents::Event amount, ProfileEvents::Event sleep)
+{
+    return std::make_shared<Throttler>(1000, 0, nullptr, amount, sleep);
 }
 
 class FailingAuth final : public google::cloud::internal::GrpcAuthenticationStrategy
@@ -296,5 +345,182 @@ TEST(GCSGrpcClientFoundation, FakeStreamingRequests)
     ASSERT_TRUE(write_stream.stream->Write(write_request));
     EXPECT_TRUE(write_stream.stream->WritesDone());
     EXPECT_TRUE(write_stream.stream->Finish().ok());
+}
+
+TEST(GCSGrpcClientFoundation, RetryableUnaryRequestRetriesAndAccounts)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->get_object_statuses = {grpc::Status(grpc::StatusCode::UNAVAILABLE, "temporarily unavailable")};
+    fake_stub->get_object_response.set_name("projects/_/buckets/test/objects/path");
+
+    GCS::ClientSettings settings;
+    settings.max_retry_attempts = 2;
+    GCS::Client client(settings, fake_stub);
+
+    google::storage::v2::GetObjectRequest request;
+    request.set_bucket("projects/_/buckets/test");
+    request.set_object("path");
+
+    auto result = client.getObject(request);
+    ASSERT_TRUE(result.ok()) << result.status.message;
+    EXPECT_EQ(2, fake_stub->get_object_requests.size());
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSGetObject));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSReadRequestsCount));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSReadRequestAttempts));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadRequestsErrors));
+    EXPECT_EQ(0, profileEventValue(ProfileEvents::GCSReadRequestsThrottling));
+}
+
+TEST(GCSGrpcClientFoundation, ThrottledUnaryRequestRetriesAndAccounts)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->list_objects_statuses = {grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "quota exhausted")};
+
+    GCS::ClientSettings settings;
+    settings.max_retry_attempts = 2;
+    GCS::Client client(settings, fake_stub);
+
+    google::storage::v2::ListObjectsRequest request;
+    request.set_parent("projects/_/buckets/test");
+
+    auto result = client.listObjects(request);
+    ASSERT_TRUE(result.ok()) << result.status.message;
+    EXPECT_EQ(2, fake_stub->list_objects_requests.size());
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSListObjects));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSWriteRequestsCount));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSWriteRequestAttempts));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestsThrottling));
+    EXPECT_EQ(0, profileEventValue(ProfileEvents::GCSWriteRequestsErrors));
+}
+
+TEST(GCSGrpcClientFoundation, NonRetryableUnaryRequestFailsOnceAndAccounts)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->delete_object_status = grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "denied");
+
+    GCS::ClientSettings settings;
+    settings.max_retry_attempts = 3;
+    GCS::Client client(settings, fake_stub);
+
+    google::storage::v2::DeleteObjectRequest request;
+    request.set_bucket("projects/_/buckets/test");
+    request.set_object("path");
+
+    auto status = client.deleteObject(request);
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, status.code);
+    EXPECT_EQ(1, fake_stub->delete_object_requests.size());
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSDeleteObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestAttempts));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestsErrors));
+    EXPECT_EQ(0, profileEventValue(ProfileEvents::GCSWriteRequestRetryableErrors));
+    EXPECT_EQ(0, profileEventValue(ProfileEvents::GCSWriteRequestsThrottling));
+}
+
+TEST(GCSGrpcClientFoundation, RequestThrottlersAccountProviderAndDiskEvents)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->get_object_response.set_name("projects/_/buckets/test/objects/path");
+
+    GCS::ClientSettings settings;
+    settings.for_disk = true;
+    settings.request_throttler.get_throttler
+        = blockingRequestThrottler(ProfileEvents::GCSGetRequestThrottlerCount, ProfileEvents::GCSGetRequestThrottlerSleepMicroseconds);
+    settings.request_throttler.put_throttler
+        = blockingRequestThrottler(ProfileEvents::GCSPutRequestThrottlerCount, ProfileEvents::GCSPutRequestThrottlerSleepMicroseconds);
+    GCS::Client client(settings, fake_stub);
+
+    google::storage::v2::GetObjectRequest get_request;
+    get_request.set_bucket("projects/_/buckets/test");
+    get_request.set_object("path");
+    ASSERT_TRUE(client.getObject(get_request).ok());
+
+    google::storage::v2::ListObjectsRequest list_request;
+    list_request.set_parent("projects/_/buckets/test");
+    ASSERT_TRUE(client.listObjects(list_request).ok());
+
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSGetRequestThrottlerCount));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSGetRequestThrottlerBlocked));
+    EXPECT_GT(profileEventValue(ProfileEvents::GCSGetRequestThrottlerSleepMicroseconds), 0);
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSGetRequestThrottlerCount));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSGetRequestThrottlerBlocked));
+    EXPECT_GT(profileEventValue(ProfileEvents::DiskGCSGetRequestThrottlerSleepMicroseconds), 0);
+
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSPutRequestThrottlerCount));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSPutRequestThrottlerBlocked));
+    EXPECT_GT(profileEventValue(ProfileEvents::GCSPutRequestThrottlerSleepMicroseconds), 0);
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSPutRequestThrottlerCount));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSPutRequestThrottlerBlocked));
+    EXPECT_GT(profileEventValue(ProfileEvents::DiskGCSPutRequestThrottlerSleepMicroseconds), 0);
+}
+
+TEST(GCSGrpcClientFoundation, StreamCreationRetriesBeforeReturningStream)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->read_object_null_streams = 1;
+    google::storage::v2::ReadObjectResponse read_response;
+    read_response.mutable_checksummed_data()->set_content("abc");
+    fake_stub->read_object_responses = {read_response};
+
+    GCS::ClientSettings settings;
+    settings.max_retry_attempts = 2;
+    GCS::Client client(settings, fake_stub);
+
+    google::storage::v2::ReadObjectRequest request;
+    request.set_bucket("projects/_/buckets/test");
+    request.set_object("path");
+
+    auto stream = client.readObject(request);
+    ASSERT_TRUE(stream.ok()) << stream.status.message;
+    EXPECT_EQ(2, fake_stub->read_object_requests.size());
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSReadObject));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSReadRequestAttempts));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadRequestsErrors));
+    EXPECT_TRUE(stream.stream->Finish().ok());
+}
+
+TEST(GCSGrpcClientFoundation, WriteStreamFailureAfterPayloadIsNotReplayed)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->write_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "finish failed");
+
+    GCS::ClientSettings settings;
+    settings.max_retry_attempts = 3;
+    GCS::Client client(settings, fake_stub);
+
+    google::storage::v2::WriteObjectResponse response;
+    auto stream = client.writeObject(response, "projects/_/buckets/test");
+    ASSERT_TRUE(stream.ok()) << stream.status.message;
+
+    google::storage::v2::WriteObjectRequest write_request;
+    write_request.mutable_write_object_spec()->mutable_resource()->set_bucket("projects/_/buckets/test");
+    write_request.mutable_write_object_spec()->mutable_resource()->set_name("path");
+    ASSERT_TRUE(stream.stream->Write(write_request));
+    ASSERT_TRUE(stream.stream->WritesDone());
+
+    auto finish_status = stream.stream->Finish();
+    EXPECT_FALSE(finish_status.ok());
+    EXPECT_EQ(1, fake_stub->write_object_stream_creations);
+    EXPECT_EQ(1, fake_stub->write_object_finish_calls);
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestAttempts));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestsErrors));
+    EXPECT_EQ(0, profileEventValue(ProfileEvents::GCSWriteRequestsThrottling));
 }
 #endif

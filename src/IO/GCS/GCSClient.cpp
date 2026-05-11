@@ -1,6 +1,8 @@
 #include <IO/GCS/GCSClient.h>
 
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/Stopwatch.h>
 
 #include <algorithm>
 #include <limits>
@@ -19,6 +21,52 @@
 namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
+}
+
+namespace ProfileEvents
+{
+extern const Event GCSGetObject;
+extern const Event GCSListObjects;
+extern const Event GCSDeleteObject;
+extern const Event GCSReadObject;
+extern const Event GCSWriteObject;
+extern const Event DiskGCSGetObject;
+extern const Event DiskGCSListObjects;
+extern const Event DiskGCSDeleteObject;
+extern const Event DiskGCSReadObject;
+extern const Event DiskGCSWriteObject;
+extern const Event GCSReadMicroseconds;
+extern const Event GCSReadRequestsCount;
+extern const Event GCSReadRequestsErrors;
+extern const Event GCSReadRequestsThrottling;
+extern const Event GCSReadRequestAttempts;
+extern const Event GCSReadRequestRetryableErrors;
+extern const Event GCSWriteMicroseconds;
+extern const Event GCSWriteRequestsCount;
+extern const Event GCSWriteRequestsErrors;
+extern const Event GCSWriteRequestsThrottling;
+extern const Event GCSWriteRequestAttempts;
+extern const Event GCSWriteRequestRetryableErrors;
+extern const Event DiskGCSReadMicroseconds;
+extern const Event DiskGCSReadRequestsCount;
+extern const Event DiskGCSReadRequestsErrors;
+extern const Event DiskGCSReadRequestsThrottling;
+extern const Event DiskGCSReadRequestAttempts;
+extern const Event DiskGCSReadRequestRetryableErrors;
+extern const Event DiskGCSWriteMicroseconds;
+extern const Event DiskGCSWriteRequestsCount;
+extern const Event DiskGCSWriteRequestsErrors;
+extern const Event DiskGCSWriteRequestsThrottling;
+extern const Event DiskGCSWriteRequestAttempts;
+extern const Event DiskGCSWriteRequestRetryableErrors;
+extern const Event GCSGetRequestThrottlerBlocked;
+extern const Event GCSPutRequestThrottlerBlocked;
+extern const Event DiskGCSGetRequestThrottlerCount;
+extern const Event DiskGCSGetRequestThrottlerBlocked;
+extern const Event DiskGCSGetRequestThrottlerSleepMicroseconds;
+extern const Event DiskGCSPutRequestThrottlerCount;
+extern const Event DiskGCSPutRequestThrottlerBlocked;
+extern const Event DiskGCSPutRequestThrottlerSleepMicroseconds;
 }
 
 namespace DB::GCS
@@ -64,6 +112,115 @@ void assertGrpcAvailable()
 namespace
 {
 
+struct OperationEvents
+{
+    ProfileEvents::Event operation;
+    ProfileEvents::Event disk_operation;
+    ProfileEvents::Event microseconds;
+    ProfileEvents::Event count;
+    ProfileEvents::Event errors;
+    ProfileEvents::Event throttling;
+    ProfileEvents::Event attempts;
+    ProfileEvents::Event retryable_errors;
+    ProfileEvents::Event disk_microseconds;
+    ProfileEvents::Event disk_count;
+    ProfileEvents::Event disk_errors;
+    ProfileEvents::Event disk_throttling;
+    ProfileEvents::Event disk_attempts;
+    ProfileEvents::Event disk_retryable_errors;
+    bool use_get_throttler;
+    bool retry_stream_creation;
+};
+
+const OperationEvents get_object_events{
+    ProfileEvents::GCSGetObject,
+    ProfileEvents::DiskGCSGetObject,
+    ProfileEvents::GCSReadMicroseconds,
+    ProfileEvents::GCSReadRequestsCount,
+    ProfileEvents::GCSReadRequestsErrors,
+    ProfileEvents::GCSReadRequestsThrottling,
+    ProfileEvents::GCSReadRequestAttempts,
+    ProfileEvents::GCSReadRequestRetryableErrors,
+    ProfileEvents::DiskGCSReadMicroseconds,
+    ProfileEvents::DiskGCSReadRequestsCount,
+    ProfileEvents::DiskGCSReadRequestsErrors,
+    ProfileEvents::DiskGCSReadRequestsThrottling,
+    ProfileEvents::DiskGCSReadRequestAttempts,
+    ProfileEvents::DiskGCSReadRequestRetryableErrors,
+    true,
+    false};
+
+const OperationEvents list_objects_events{
+    ProfileEvents::GCSListObjects,
+    ProfileEvents::DiskGCSListObjects,
+    ProfileEvents::GCSWriteMicroseconds,
+    ProfileEvents::GCSWriteRequestsCount,
+    ProfileEvents::GCSWriteRequestsErrors,
+    ProfileEvents::GCSWriteRequestsThrottling,
+    ProfileEvents::GCSWriteRequestAttempts,
+    ProfileEvents::GCSWriteRequestRetryableErrors,
+    ProfileEvents::DiskGCSWriteMicroseconds,
+    ProfileEvents::DiskGCSWriteRequestsCount,
+    ProfileEvents::DiskGCSWriteRequestsErrors,
+    ProfileEvents::DiskGCSWriteRequestsThrottling,
+    ProfileEvents::DiskGCSWriteRequestAttempts,
+    ProfileEvents::DiskGCSWriteRequestRetryableErrors,
+    false,
+    false};
+
+const OperationEvents delete_object_events{
+    ProfileEvents::GCSDeleteObject,
+    ProfileEvents::DiskGCSDeleteObject,
+    ProfileEvents::GCSWriteMicroseconds,
+    ProfileEvents::GCSWriteRequestsCount,
+    ProfileEvents::GCSWriteRequestsErrors,
+    ProfileEvents::GCSWriteRequestsThrottling,
+    ProfileEvents::GCSWriteRequestAttempts,
+    ProfileEvents::GCSWriteRequestRetryableErrors,
+    ProfileEvents::DiskGCSWriteMicroseconds,
+    ProfileEvents::DiskGCSWriteRequestsCount,
+    ProfileEvents::DiskGCSWriteRequestsErrors,
+    ProfileEvents::DiskGCSWriteRequestsThrottling,
+    ProfileEvents::DiskGCSWriteRequestAttempts,
+    ProfileEvents::DiskGCSWriteRequestRetryableErrors,
+    false,
+    false};
+
+const OperationEvents read_object_events{
+    ProfileEvents::GCSReadObject,
+    ProfileEvents::DiskGCSReadObject,
+    ProfileEvents::GCSReadMicroseconds,
+    ProfileEvents::GCSReadRequestsCount,
+    ProfileEvents::GCSReadRequestsErrors,
+    ProfileEvents::GCSReadRequestsThrottling,
+    ProfileEvents::GCSReadRequestAttempts,
+    ProfileEvents::GCSReadRequestRetryableErrors,
+    ProfileEvents::DiskGCSReadMicroseconds,
+    ProfileEvents::DiskGCSReadRequestsCount,
+    ProfileEvents::DiskGCSReadRequestsErrors,
+    ProfileEvents::DiskGCSReadRequestsThrottling,
+    ProfileEvents::DiskGCSReadRequestAttempts,
+    ProfileEvents::DiskGCSReadRequestRetryableErrors,
+    true,
+    true};
+
+const OperationEvents write_object_events{
+    ProfileEvents::GCSWriteObject,
+    ProfileEvents::DiskGCSWriteObject,
+    ProfileEvents::GCSWriteMicroseconds,
+    ProfileEvents::GCSWriteRequestsCount,
+    ProfileEvents::GCSWriteRequestsErrors,
+    ProfileEvents::GCSWriteRequestsThrottling,
+    ProfileEvents::GCSWriteRequestAttempts,
+    ProfileEvents::GCSWriteRequestRetryableErrors,
+    ProfileEvents::DiskGCSWriteMicroseconds,
+    ProfileEvents::DiskGCSWriteRequestsCount,
+    ProfileEvents::DiskGCSWriteRequestsErrors,
+    ProfileEvents::DiskGCSWriteRequestsThrottling,
+    ProfileEvents::DiskGCSWriteRequestAttempts,
+    ProfileEvents::DiskGCSWriteRequestRetryableErrors,
+    false,
+    true};
 
 Status fromCloudStatus(const google::cloud::Status & status)
 {
@@ -93,6 +250,186 @@ Status fromCloudStatus(const google::cloud::Status & status)
             return makeStatus(StatusCode::Unknown, status.message());
     }
 }
+
+void configureRequestThrottlerEvents(ClientSettings & settings)
+{
+    settings.request_throttler.get_blocked = ProfileEvents::GCSGetRequestThrottlerBlocked;
+    settings.request_throttler.put_blocked = ProfileEvents::GCSPutRequestThrottlerBlocked;
+
+    if (settings.for_disk)
+    {
+        settings.request_throttler.disk_get_amount = ProfileEvents::DiskGCSGetRequestThrottlerCount;
+        settings.request_throttler.disk_get_blocked = ProfileEvents::DiskGCSGetRequestThrottlerBlocked;
+        settings.request_throttler.disk_get_sleep_us = ProfileEvents::DiskGCSGetRequestThrottlerSleepMicroseconds;
+        settings.request_throttler.disk_put_amount = ProfileEvents::DiskGCSPutRequestThrottlerCount;
+        settings.request_throttler.disk_put_blocked = ProfileEvents::DiskGCSPutRequestThrottlerBlocked;
+        settings.request_throttler.disk_put_sleep_us = ProfileEvents::DiskGCSPutRequestThrottlerSleepMicroseconds;
+    }
+}
+
+UInt64 maxAttempts(const ClientSettings & settings)
+{
+    return std::max<UInt64>(settings.max_retry_attempts, 1);
+}
+
+void throttleRequest(const ClientSettings & settings, const OperationEvents & events)
+{
+    if (events.use_get_throttler)
+        settings.request_throttler.throttleHTTPGet();
+    else
+        settings.request_throttler.throttleHTTPPut();
+}
+
+void recordAttemptStart(const OperationEvents & events, bool for_disk)
+{
+    ProfileEvents::increment(events.operation);
+    ProfileEvents::increment(events.count);
+    ProfileEvents::increment(events.attempts);
+
+    if (for_disk)
+    {
+        ProfileEvents::increment(events.disk_operation);
+        ProfileEvents::increment(events.disk_count);
+        ProfileEvents::increment(events.disk_attempts);
+    }
+}
+
+void recordAttemptTime(const OperationEvents & events, bool for_disk, UInt64 elapsed_microseconds)
+{
+    ProfileEvents::increment(events.microseconds, elapsed_microseconds);
+    if (for_disk)
+        ProfileEvents::increment(events.disk_microseconds, elapsed_microseconds);
+}
+
+void recordFailure(const OperationEvents & events, bool for_disk, StatusCode code)
+{
+    if (isThrottlingStatus(code))
+    {
+        ProfileEvents::increment(events.throttling);
+        if (for_disk)
+            ProfileEvents::increment(events.disk_throttling);
+    }
+    else
+    {
+        ProfileEvents::increment(events.errors);
+        if (for_disk)
+            ProfileEvents::increment(events.disk_errors);
+    }
+
+    if (isRetryableStatus(code))
+    {
+        ProfileEvents::increment(events.retryable_errors);
+        if (for_disk)
+            ProfileEvents::increment(events.disk_retryable_errors);
+    }
+}
+
+bool shouldRetry(const Status & status, UInt64 attempt, UInt64 max_attempts)
+{
+    return !status.ok() && attempt < max_attempts && isRetryableStatus(status.code);
+}
+
+template <typename Response, typename Request, typename Call>
+Result<Response> executeUnaryRequest(
+    const Client & client,
+    const ClientSettings & settings,
+    const OperationEvents & events,
+    const Request & request,
+    const std::string & request_params,
+    Call && call)
+{
+    Result<Response> result;
+    const UInt64 attempts = maxAttempts(settings);
+
+    for (UInt64 attempt = 1; attempt <= attempts; ++attempt)
+    {
+        auto context = client.makeContext(result.status, request_params);
+        if (!result.ok())
+            return result;
+
+        throttleRequest(settings, events);
+        recordAttemptStart(events, settings.for_disk);
+
+        Stopwatch watch;
+        result.status = fromGrpcStatus(call(*context, request, result.response));
+        recordAttemptTime(events, settings.for_disk, watch.elapsedMicroseconds());
+
+        if (result.ok())
+            return result;
+
+        recordFailure(events, settings.for_disk, result.status.code);
+        if (!shouldRetry(result.status, attempt, attempts))
+            return result;
+    }
+
+    return result;
+}
+
+template <typename Stream>
+class AccountingReader final : public grpc::ClientReaderInterface<Stream>
+{
+public:
+    AccountingReader(std::unique_ptr<grpc::ClientReaderInterface<Stream>> stream_, OperationEvents events_, bool for_disk_)
+        : stream(std::move(stream_))
+        , events(events_)
+        , for_disk(for_disk_)
+    {
+    }
+
+    void WaitForInitialMetadata() override { stream->WaitForInitialMetadata(); }
+    bool NextMessageSize(uint32_t * size) override { return stream->NextMessageSize(size); }
+    bool Read(Stream * message) override { return stream->Read(message); }
+
+    grpc::Status Finish() override
+    {
+        auto status = stream->Finish();
+        if (!finish_accounted && !status.ok())
+        {
+            finish_accounted = true;
+            recordFailure(events, for_disk, fromGrpcStatus(status).code);
+        }
+        return status;
+    }
+
+private:
+    std::unique_ptr<grpc::ClientReaderInterface<Stream>> stream;
+    OperationEvents events;
+    bool for_disk;
+    bool finish_accounted = false;
+};
+
+template <typename Stream>
+class AccountingWriter final : public grpc::ClientWriterInterface<Stream>
+{
+public:
+    AccountingWriter(std::unique_ptr<grpc::ClientWriterInterface<Stream>> stream_, OperationEvents events_, bool for_disk_)
+        : stream(std::move(stream_))
+        , events(events_)
+        , for_disk(for_disk_)
+    {
+    }
+
+    void WaitForInitialMetadata() { stream->WaitForInitialMetadata(); }
+    bool Write(const Stream & message, grpc::WriteOptions options) override { return stream->Write(message, options); }
+    bool WritesDone() override { return stream->WritesDone(); }
+
+    grpc::Status Finish() override
+    {
+        auto status = stream->Finish();
+        if (!finish_accounted && !status.ok())
+        {
+            finish_accounted = true;
+            recordFailure(events, for_disk, fromGrpcStatus(status).code);
+        }
+        return status;
+    }
+
+private:
+    std::unique_ptr<grpc::ClientWriterInterface<Stream>> stream;
+    OperationEvents events;
+    bool for_disk;
+    bool finish_accounted = false;
+};
 
 class GeneratedStub final : public IStub
 {
@@ -160,6 +497,16 @@ std::string bucketRoutingParameter(const std::string & bucket)
     return "bucket=" + google::cloud::internal::UrlEncode(bucket);
 }
 
+grpc::Status nextStatus(std::vector<grpc::Status> & statuses, const grpc::Status & fallback)
+{
+    if (statuses.empty())
+        return fallback;
+
+    auto status = statuses.front();
+    statuses.erase(statuses.begin());
+    return status;
+}
+
 }
 
 Client::Client(
@@ -168,6 +515,7 @@ Client::Client(
     , stub(std::move(stub_))
     , auth(std::move(auth_))
 {
+    configureRequestThrottlerEvents(settings);
 }
 
 std::unique_ptr<grpc::ClientContext> Client::makeContext(Status & status, const std::string & request_params) const
@@ -190,48 +538,74 @@ std::unique_ptr<grpc::ClientContext> Client::makeContext(Status & status, const 
 
 Result<google::storage::v2::Object> Client::getObject(const google::storage::v2::GetObjectRequest & request) const
 {
-    Result<google::storage::v2::Object> result;
-    auto context = makeContext(result.status, bucketRoutingParameter(request.bucket()));
-    if (!result.ok())
-        return result;
-
-    result.status = fromGrpcStatus(stub->getObject(*context, request, result.response));
-    return result;
+    return executeUnaryRequest<google::storage::v2::Object>(
+        *this,
+        settings,
+        get_object_events,
+        request,
+        bucketRoutingParameter(request.bucket()),
+        [this](grpc::ClientContext & context, const auto & request_, auto & response)
+        { return stub->getObject(context, request_, response); });
 }
 
 Result<google::storage::v2::ListObjectsResponse> Client::listObjects(const google::storage::v2::ListObjectsRequest & request) const
 {
-    Result<google::storage::v2::ListObjectsResponse> result;
-    auto context = makeContext(result.status, bucketRoutingParameter(request.parent()));
-    if (!result.ok())
-        return result;
-
-    result.status = fromGrpcStatus(stub->listObjects(*context, request, result.response));
-    return result;
+    return executeUnaryRequest<google::storage::v2::ListObjectsResponse>(
+        *this,
+        settings,
+        list_objects_events,
+        request,
+        bucketRoutingParameter(request.parent()),
+        [this](grpc::ClientContext & context, const auto & request_, auto & response)
+        { return stub->listObjects(context, request_, response); });
 }
 
 Status Client::deleteObject(const google::storage::v2::DeleteObjectRequest & request) const
 {
-    Status status;
-    auto context = makeContext(status, bucketRoutingParameter(request.bucket()));
-    if (!status.ok())
-        return status;
-
-    google::protobuf::Empty response;
-    return fromGrpcStatus(stub->deleteObject(*context, request, response));
+    auto result = executeUnaryRequest<google::protobuf::Empty>(
+        *this,
+        settings,
+        delete_object_events,
+        request,
+        bucketRoutingParameter(request.bucket()),
+        [this](grpc::ClientContext & context, const auto & request_, auto & response_)
+        { return stub->deleteObject(context, request_, response_); });
+    return result.status;
 }
 
 StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>>
 Client::readObject(const google::storage::v2::ReadObjectRequest & request) const
 {
     StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>> result;
-    result.context = makeContext(result.status, bucketRoutingParameter(request.bucket()));
-    if (!result.status.ok())
-        return result;
+    const UInt64 attempts = maxAttempts(settings);
 
-    result.stream = stub->readObject(*result.context, request);
-    if (!result.stream)
-        result.status = makeStatus(StatusCode::Unknown, "GCS gRPC ReadObject did not create a stream");
+    for (UInt64 attempt = 1; attempt <= attempts; ++attempt)
+    {
+        result.context = makeContext(result.status, bucketRoutingParameter(request.bucket()));
+        if (!result.status.ok())
+            return result;
+
+        throttleRequest(settings, read_object_events);
+        recordAttemptStart(read_object_events, settings.for_disk);
+
+        Stopwatch watch;
+        auto stream = stub->readObject(*result.context, request);
+        recordAttemptTime(read_object_events, settings.for_disk, watch.elapsedMicroseconds());
+
+        if (stream)
+        {
+            result.stream = std::make_unique<AccountingReader<google::storage::v2::ReadObjectResponse>>(
+                std::move(stream), read_object_events, settings.for_disk);
+            result.status = {};
+            return result;
+        }
+
+        result.status = makeStatus(StatusCode::Unavailable, "GCS gRPC ReadObject did not create a stream");
+        recordFailure(read_object_events, settings.for_disk, result.status.code);
+        if (!read_object_events.retry_stream_creation || !shouldRetry(result.status, attempt, attempts))
+            return result;
+    }
+
     return result;
 }
 
@@ -239,13 +613,35 @@ StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest
 Client::writeObject(google::storage::v2::WriteObjectResponse & response, const std::string & bucket) const
 {
     StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>> result;
-    result.context = makeContext(result.status, bucketRoutingParameter(bucket));
-    if (!result.status.ok())
-        return result;
+    const UInt64 attempts = maxAttempts(settings);
 
-    result.stream = stub->writeObject(*result.context, response);
-    if (!result.stream)
-        result.status = makeStatus(StatusCode::Unknown, "GCS gRPC WriteObject did not create a stream");
+    for (UInt64 attempt = 1; attempt <= attempts; ++attempt)
+    {
+        result.context = makeContext(result.status, bucketRoutingParameter(bucket));
+        if (!result.status.ok())
+            return result;
+
+        throttleRequest(settings, write_object_events);
+        recordAttemptStart(write_object_events, settings.for_disk);
+
+        Stopwatch watch;
+        auto stream = stub->writeObject(*result.context, response);
+        recordAttemptTime(write_object_events, settings.for_disk, watch.elapsedMicroseconds());
+
+        if (stream)
+        {
+            result.stream = std::make_unique<AccountingWriter<google::storage::v2::WriteObjectRequest>>(
+                std::move(stream), write_object_events, settings.for_disk);
+            result.status = {};
+            return result;
+        }
+
+        result.status = makeStatus(StatusCode::Unavailable, "GCS gRPC WriteObject did not create a stream");
+        recordFailure(write_object_events, settings.for_disk, result.status.code);
+        if (!write_object_events.retry_stream_creation || !shouldRetry(result.status, attempt, attempts))
+            return result;
+    }
+
     return result;
 }
 
@@ -348,7 +744,6 @@ grpc::Status FakeWriteStream::Finish()
     return finish_status;
 }
 
-
 namespace
 {
 
@@ -373,8 +768,9 @@ grpc::Status FakeStub::getObject(
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     get_object_requests.push_back(request);
 
-    if (!get_object_status.ok())
-        return get_object_status;
+    auto status = nextStatus(get_object_statuses, get_object_status);
+    if (!status.ok())
+        return status;
 
     if (use_object_map)
     {
@@ -386,7 +782,7 @@ grpc::Status FakeStub::getObject(
     }
 
     response = get_object_response;
-    return get_object_status;
+    return status;
 }
 
 grpc::Status FakeStub::listObjects(
@@ -398,8 +794,9 @@ grpc::Status FakeStub::listObjects(
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     list_objects_requests.push_back(request);
 
-    if (!list_objects_status.ok())
-        return list_objects_status;
+    auto status = nextStatus(list_objects_statuses, list_objects_status);
+    if (!status.ok())
+        return status;
 
     if (use_object_map)
     {
@@ -429,7 +826,7 @@ grpc::Status FakeStub::listObjects(
     }
 
     response = list_objects_response;
-    return list_objects_status;
+    return status;
 }
 
 grpc::Status
@@ -439,8 +836,9 @@ FakeStub::deleteObject(grpc::ClientContext & context, const google::storage::v2:
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     delete_object_requests.push_back(request);
 
-    if (!delete_object_status.ok())
-        return delete_object_status;
+    auto status = nextStatus(delete_object_statuses, delete_object_status);
+    if (!status.ok())
+        return status;
 
     if (use_object_map)
     {
@@ -459,6 +857,12 @@ FakeStub::readObject(grpc::ClientContext & context, const google::storage::v2::R
     last_deadline = context.deadline();
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
     read_object_requests.push_back(request);
+
+    if (read_object_null_streams > 0)
+    {
+        --read_object_null_streams;
+        return nullptr;
+    }
 
     if (use_object_map)
     {
@@ -489,7 +893,14 @@ FakeStub::writeObject(grpc::ClientContext & context, google::storage::v2::WriteO
 {
     last_deadline = context.deadline();
     last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
+    ++write_object_stream_creations;
     response = write_object_response;
+
+    if (write_object_null_streams > 0)
+    {
+        --write_object_null_streams;
+        return nullptr;
+    }
 
     auto finish_callback =
         [this](
@@ -531,5 +942,4 @@ FakeStub::writeObject(grpc::ClientContext & context, google::storage::v2::WriteO
 }
 
 #endif
-
 }

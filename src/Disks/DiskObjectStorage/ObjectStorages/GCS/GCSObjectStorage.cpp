@@ -1,13 +1,15 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.h>
 
-#include <Common/Exception.h>
-#include <Common/Macros.h>
-#include <Common/ObjectStorageKeyGenerator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/copyData.h>
 #include <Interpreters/Context.h>
+#include <Common/Exception.h>
+#include <Common/Macros.h>
+#include <Common/ObjectStorageKeyGenerator.h>
+#include <Common/ProfileEvents.h>
+#include <Common/Throttler.h>
 
 #include <fmt/format.h>
 
@@ -17,15 +19,23 @@
 #    include <absl/strings/cord.h>
 #endif
 
+namespace ProfileEvents
+{
+extern const Event GCSGetRequestThrottlerCount;
+extern const Event GCSGetRequestThrottlerSleepMicroseconds;
+extern const Event GCSPutRequestThrottlerCount;
+extern const Event GCSPutRequestThrottlerSleepMicroseconds;
+}
+
 namespace DB
 {
 
 namespace ErrorCodes
 {
-    extern const int BAD_ARGUMENTS;
-    extern const int FILE_DOESNT_EXIST;
-    extern const int NOT_IMPLEMENTED;
-    extern const int S3_ERROR;
+extern const int BAD_ARGUMENTS;
+extern const int FILE_DOESNT_EXIST;
+extern const int NOT_IMPLEMENTED;
+extern const int S3_ERROR;
 }
 
 static String expandConfigString(const Poco::Util::AbstractConfiguration & config, const String & key, const ContextPtr & context)
@@ -99,11 +109,7 @@ class GCSReadBuffer final : public ReadBufferFromFileBase
 {
 public:
     GCSReadBuffer(
-        std::shared_ptr<GCS::Client> client_,
-        String bucket_,
-        String object_name_,
-        size_t buf_size,
-        std::optional<size_t> file_size_)
+        std::shared_ptr<GCS::Client> client_, String bucket_, String object_name_, size_t buf_size, std::optional<size_t> file_size_)
         : ReadBufferFromFileBase(buf_size, nullptr, 0, file_size_)
         , client(std::move(client_))
         , bucket(std::move(bucket_))
@@ -126,17 +132,15 @@ public:
         if (new_position < 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS read buffer cannot seek to negative offset {}", new_position);
         if (file_size && static_cast<size_t>(new_position) > *file_size)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS read buffer seek offset {} is past object size {}", new_position, *file_size);
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS, "Native GCS read buffer seek offset {} is past object size {}", new_position, *file_size);
 
         read_offset = static_cast<size_t>(new_position);
         set(internal_buffer.begin(), internal_buffer.size());
         return new_position;
     }
 
-    off_t getPosition() override
-    {
-        return static_cast<off_t>(read_offset - available());
-    }
+    off_t getPosition() override { return static_cast<off_t>(read_offset - available()); }
 
     bool supportsReadAt() override { return true; }
     bool supportsRightBoundedReads() const override { return true; }
@@ -154,10 +158,7 @@ public:
     size_t getFileOffsetOfBufferEnd() const override { return read_offset; }
 
 private:
-    size_t available() const
-    {
-        return static_cast<size_t>(working_buffer.end() - pos);
-    }
+    size_t available() const { return static_cast<size_t>(working_buffer.end() - pos); }
 
     bool nextImpl() override
     {
@@ -235,10 +236,7 @@ public:
 private:
     static constexpr size_t max_write_chunk_bytes = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
 
-    void nextImpl() override
-    {
-        sendChunks(working_buffer.begin(), offset(), /* finish */ false);
-    }
+    void nextImpl() override { sendChunks(working_buffer.begin(), offset(), /* finish */ false); }
 
     void finalizeImpl() override
     {
@@ -373,10 +371,8 @@ bool GCSObjectStorage::exists(const StoredObject & object) const
 #endif
 }
 
-std::unique_ptr<ReadBufferFromFileBase> GCSObjectStorage::readObject(
-    const StoredObject & object,
-    const ReadSettings & read_settings,
-    std::optional<size_t>) const
+std::unique_ptr<ReadBufferFromFileBase>
+GCSObjectStorage::readObject(const StoredObject & object, const ReadSettings & read_settings, std::optional<size_t>) const
 {
 #if USE_GOOGLE_CLOUD
     std::optional<size_t> file_size;
@@ -384,11 +380,7 @@ std::unique_ptr<ReadBufferFromFileBase> GCSObjectStorage::readObject(
         file_size = static_cast<size_t>(object.bytes_size);
 
     return std::make_unique<GCSReadBuffer>(
-        client,
-        settings.bucket,
-        objectName(object.remote_path),
-        read_settings.remote_fs_buffer_size,
-        file_size);
+        client, settings.bucket, objectName(object.remote_path), read_settings.remote_fs_buffer_size, file_size);
 #else
     (void)object;
     (void)read_settings;
@@ -397,11 +389,7 @@ std::unique_ptr<ReadBufferFromFileBase> GCSObjectStorage::readObject(
 }
 
 std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
-    const StoredObject & object,
-    WriteMode mode,
-    std::optional<ObjectAttributes> attributes,
-    size_t buf_size,
-    const WriteSettings &)
+    const StoredObject & object, WriteMode mode, std::optional<ObjectAttributes> attributes, size_t buf_size, const WriteSettings &)
 {
 #if USE_GOOGLE_CLOUD
     if (mode != WriteMode::Rewrite)
@@ -470,7 +458,8 @@ void GCSObjectStorage::copyObjectToAnotherObjectStorage(
     }
 
     auto in = readObject(object_from, read_settings);
-    auto out = object_storage_to.writeObject(object_to, WriteMode::Rewrite, std::move(object_to_attributes), DBMS_DEFAULT_BUFFER_SIZE, write_settings);
+    auto out = object_storage_to.writeObject(
+        object_to, WriteMode::Rewrite, std::move(object_to_attributes), DBMS_DEFAULT_BUFFER_SIZE, write_settings);
     copyData(*in, *out);
     out->finalize();
 }
@@ -518,9 +507,8 @@ void GCSObjectStorage::listObjects(const std::string & path, RelativePathsWithMe
 
         for (const auto & object : result.response.objects())
         {
-            children.emplace_back(std::make_shared<RelativePathWithMetadata>(
-                object.name(),
-                metadataFromProto(object, /* with_tags */ false)));
+            children.emplace_back(
+                std::make_shared<RelativePathWithMetadata>(object.name(), metadataFromProto(object, /* with_tags */ false)));
             if (target_keys && children.size() >= target_keys)
                 return;
         }
@@ -536,10 +524,7 @@ void GCSObjectStorage::listObjects(const std::string & path, RelativePathsWithMe
 }
 
 ObjectStorageIteratorPtr GCSObjectStorage::iterate(
-    const std::string & path_prefix,
-    size_t max_keys,
-    bool with_tags,
-    const std::optional<std::string> & start_after) const
+    const std::string & path_prefix, size_t max_keys, bool with_tags, const std::optional<std::string> & start_after) const
 {
 #if USE_GOOGLE_CLOUD
     RelativePathsWithMetadata files;
@@ -563,9 +548,7 @@ ObjectStorageIteratorPtr GCSObjectStorage::iterate(
             if (start_after && !start_after->empty() && object.name() <= *start_after)
                 continue;
 
-            files.emplace_back(std::make_shared<RelativePathWithMetadata>(
-                object.name(),
-                metadataFromProto(object, with_tags)));
+            files.emplace_back(std::make_shared<RelativePathWithMetadata>(object.name(), metadataFromProto(object, with_tags)));
             if (max_keys && files.size() >= max_keys)
                 return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
         }
@@ -629,12 +612,30 @@ GCSObjectStorageSettings getGCSObjectStorageSettings(
     if (settings.client_settings.endpoint.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage endpoint cannot be empty");
 
-    settings.client_settings.request_timeout_ms = config.getUInt64(
-        config_prefix + ".request_timeout_ms", settings.client_settings.request_timeout_ms);
+    settings.client_settings.request_timeout_ms
+        = config.getUInt64(config_prefix + ".request_timeout_ms", settings.client_settings.request_timeout_ms);
+    settings.client_settings.max_retry_attempts
+        = config.getUInt64(config_prefix + ".max_retry_attempts", settings.client_settings.max_retry_attempts);
     settings.client_settings.service_account_json = config.getString(config_prefix + ".service_account_json", "");
     settings.client_settings.user_project = config.getString(config_prefix + ".user_project", "");
-    settings.client_settings.use_insecure_credentials_for_tests = config.getBool(
-        config_prefix + ".use_insecure_credentials_for_tests", false);
+    settings.client_settings.use_insecure_credentials_for_tests
+        = config.getBool(config_prefix + ".use_insecure_credentials_for_tests", false);
+    settings.client_settings.for_disk = true;
+
+    const auto get_request_throttler_max_speed = config.getUInt64(config_prefix + ".get_request_throttler_max_speed", 0);
+    if (get_request_throttler_max_speed)
+        settings.client_settings.request_throttler.get_throttler = std::make_shared<Throttler>(
+            get_request_throttler_max_speed,
+            ProfileEvents::GCSGetRequestThrottlerCount,
+            ProfileEvents::GCSGetRequestThrottlerSleepMicroseconds);
+
+    const auto put_request_throttler_max_speed = config.getUInt64(config_prefix + ".put_request_throttler_max_speed", 0);
+    if (put_request_throttler_max_speed)
+        settings.client_settings.request_throttler.put_throttler = std::make_shared<Throttler>(
+            put_request_throttler_max_speed,
+            ProfileEvents::GCSPutRequestThrottlerCount,
+            ProfileEvents::GCSPutRequestThrottlerSleepMicroseconds);
+
     settings.read_only = config.getBool(config_prefix + ".read_only", config.getBool(config_prefix + ".readonly", false));
     settings.description = fmt::format("{}/{}", settings.client_settings.endpoint, settings.bucket);
 
