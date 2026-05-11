@@ -2,21 +2,25 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <IO/GCS/GCSClient.h>
+#include <Common/BlobStorageLogWriter.h>
 
+#include <functional>
 #include <memory>
 #include <string_view>
-
 namespace DB
 {
 
 struct GCSObjectStorageSettings
 {
+    using BlobStorageLogWriterFactory = std::function<BlobStorageLogWriterPtr(const String &)>;
+
     String disk_name;
     String bucket;
     String key_prefix;
     String description;
     bool read_only = false;
     GCS::ClientSettings client_settings;
+    BlobStorageLogWriterFactory blob_storage_log_writer_factory;
 };
 
 class GCSObjectStorage final : public IObjectStorage
@@ -77,8 +81,10 @@ public:
     ObjectStorageKeyGeneratorPtr createKeyGenerator() const override;
 
 private:
-    [[noreturn]] void throwNotImplemented(std::string_view operation) const;
+    BlobStorageLogWriterPtr createBlobStorageLogWriter() const;
+    void removeObjectIfExistsImpl(const StoredObject & object, const BlobStorageLogWriterPtr & blob_storage_log) const;
 
+    [[noreturn]] void throwNotImplemented(std::string_view operation) const;
     GCSObjectStorageSettings settings;
 #if USE_GOOGLE_CLOUD
     std::shared_ptr<GCS::Client> client;

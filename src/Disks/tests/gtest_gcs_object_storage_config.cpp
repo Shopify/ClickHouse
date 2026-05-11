@@ -4,20 +4,23 @@
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Local/MetadataStorageFromDisk.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.h>
-#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageFactory.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
 #include <Disks/DiskObjectStorage/Replication/ObjectStorageRouter.h>
 #include <Disks/registerDisks.h>
-#include <Storages/ObjectStorage/StorageObjectStorageDefinitions.h>
-#include <Common/Exception.h>
-#include <Common/tests/gtest_global_context.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
-
+#include <Interpreters/SystemLog.h>
+#include <Storages/ObjectStorage/StorageObjectStorageDefinitions.h>
 #include <Poco/TemporaryFile.h>
 #include <Poco/Util/MapConfiguration.h>
 #include <Poco/Util/XMLConfiguration.h>
+#include <Common/CurrentThread.h>
+#include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
+#include <Common/Throttler.h>
+#include <Common/tests/gtest_global_context.h>
 
 #if USE_GOOGLE_CLOUD
 #    include <absl/strings/cord.h>
@@ -29,7 +32,60 @@
 
 namespace DB::ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
+extern const int NOT_IMPLEMENTED;
+}
+
+namespace ProfileEvents
+{
+extern const Event GCSGetObject;
+extern const Event GCSListObjects;
+extern const Event GCSDeleteObject;
+extern const Event GCSReadObject;
+extern const Event GCSWriteObject;
+extern const Event DiskGCSGetObject;
+extern const Event DiskGCSListObjects;
+extern const Event DiskGCSDeleteObject;
+extern const Event DiskGCSReadObject;
+extern const Event DiskGCSWriteObject;
+extern const Event GCSReadRequestsCount;
+extern const Event GCSReadRequestsErrors;
+extern const Event GCSReadRequestsThrottling;
+extern const Event GCSReadRequestAttempts;
+extern const Event GCSReadRequestRetryableErrors;
+extern const Event GCSWriteRequestsCount;
+extern const Event GCSWriteRequestsErrors;
+extern const Event GCSWriteRequestsThrottling;
+extern const Event GCSWriteRequestAttempts;
+extern const Event GCSWriteRequestRetryableErrors;
+extern const Event DiskGCSReadRequestsCount;
+extern const Event DiskGCSReadRequestsErrors;
+extern const Event DiskGCSReadRequestsThrottling;
+extern const Event DiskGCSReadRequestAttempts;
+extern const Event DiskGCSReadRequestRetryableErrors;
+extern const Event DiskGCSWriteRequestsCount;
+extern const Event DiskGCSWriteRequestsErrors;
+extern const Event DiskGCSWriteRequestsThrottling;
+extern const Event DiskGCSWriteRequestAttempts;
+extern const Event DiskGCSWriteRequestRetryableErrors;
+extern const Event GCSGetRequestThrottlerCount;
+extern const Event GCSGetRequestThrottlerBlocked;
+extern const Event GCSGetRequestThrottlerSleepMicroseconds;
+extern const Event GCSPutRequestThrottlerCount;
+extern const Event GCSPutRequestThrottlerBlocked;
+extern const Event GCSPutRequestThrottlerSleepMicroseconds;
+extern const Event DiskGCSGetRequestThrottlerCount;
+extern const Event DiskGCSGetRequestThrottlerBlocked;
+extern const Event DiskGCSGetRequestThrottlerSleepMicroseconds;
+extern const Event DiskGCSPutRequestThrottlerCount;
+extern const Event DiskGCSPutRequestThrottlerBlocked;
+extern const Event DiskGCSPutRequestThrottlerSleepMicroseconds;
+extern const Event ReadBufferFromGCSMicroseconds;
+extern const Event ReadBufferFromGCSInitMicroseconds;
+extern const Event ReadBufferFromGCSBytes;
+extern const Event ReadBufferFromGCSRequestsErrors;
+extern const Event WriteBufferFromGCSMicroseconds;
+extern const Event WriteBufferFromGCSBytes;
+extern const Event WriteBufferFromGCSRequestsErrors;
 }
 
 using namespace DB;
@@ -67,7 +123,66 @@ ReadSettings readSettings(size_t buffer_size)
     return settings;
 }
 
-std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(const std::shared_ptr<GCS::FakeStub> & fake_stub, bool read_only = false)
+UInt64 profileEventValue(ProfileEvents::Event event)
+{
+    return CurrentThread::getProfileEvents()[event];
+}
+
+void resetProfileEvents()
+{
+    CurrentThread::getProfileEvents().reset();
+}
+
+std::shared_ptr<Throttler> blockingThrottler(ProfileEvents::Event amount, ProfileEvents::Event sleep)
+{
+    return std::make_shared<Throttler>(1000, 0, nullptr, amount, sleep);
+}
+
+class CapturedBlobStorageLog
+{
+public:
+    CapturedBlobStorageLog()
+    {
+        SystemLogSettings settings;
+        settings.queue_settings.database = "system";
+        settings.queue_settings.table = "blob_storage_log_test";
+        settings.queue_settings.reserved_size_rows = 128;
+        settings.queue_settings.max_size_rows = 1024;
+        settings.queue_settings.buffer_size_rows_flush_threshold = 1024;
+        settings.queue_settings.flush_interval_milliseconds = 100000;
+        settings.queue_settings.notify_flush_on_crash = false;
+        settings.queue_settings.turn_off_logger = true;
+        settings.engine = "ENGINE = Null";
+
+        queue = std::make_shared<SystemLogQueue<BlobStorageLogElement>>(settings.queue_settings);
+        log = std::make_shared<BlobStorageLog>(getContext().context, settings, queue);
+    }
+
+    BlobStorageLogWriterPtr createWriter(const String & disk_name)
+    {
+        auto writer = std::make_shared<BlobStorageLogWriter>(log);
+        writer->disk_name = disk_name;
+        return writer;
+    }
+
+    std::vector<BlobStorageLogElement> drain()
+    {
+        queue->notifyFlush(queue->getLastLogIndex(), /* should_prepare_tables_anyway */ false);
+        auto result = queue->pop();
+        queue->confirm(result.last_log_index);
+        return std::move(result.logs);
+    }
+
+private:
+    std::shared_ptr<SystemLogQueue<BlobStorageLogElement>> queue;
+    BlobStorageLogPtr log;
+};
+
+std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
+    const std::shared_ptr<GCS::FakeStub> & fake_stub,
+    bool read_only = false,
+    GCS::ClientSettings client_settings = {},
+    GCSObjectStorageSettings::BlobStorageLogWriterFactory blob_storage_log_writer_factory = {})
 {
     fake_stub->use_object_map = true;
 
@@ -77,7 +192,10 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(const std::shared_ptr
     settings.key_prefix = "clickhouse-data/";
     settings.description = "fake/native-bucket";
     settings.read_only = read_only;
+    settings.client_settings = std::move(client_settings);
     settings.client_settings.use_insecure_credentials_for_tests = true;
+    settings.client_settings.for_disk = true;
+    settings.blob_storage_log_writer_factory = std::move(blob_storage_log_writer_factory);
 
     return std::make_shared<GCSObjectStorage>(settings, std::make_shared<GCS::Client>(settings.client_settings, fake_stub));
 }
@@ -93,10 +211,7 @@ void addFakeObject(const std::shared_ptr<GCS::FakeStub> & fake_stub, const Strin
 }
 
 StoredObject writeFakeObject(
-    const std::shared_ptr<GCSObjectStorage> & storage,
-    const String & path,
-    const String & data,
-    const ObjectAttributes & attributes = {})
+    const std::shared_ptr<GCSObjectStorage> & storage, const String & path, const String & data, const ObjectAttributes & attributes = {})
 {
     StoredObject object(path, path, data.size());
     std::optional<ObjectAttributes> object_attributes;
@@ -130,10 +245,7 @@ public:
         registerDisks(/* global_skip_access_check */ true);
     }
 
-    void TearDown() override
-    {
-        clearDiskRegistry();
-    }
+    void TearDown() override { clearDiskRegistry(); }
 };
 
 }
@@ -165,8 +277,8 @@ TEST_F(GCSObjectStorageConfigTest, NativeGCSConfigUsesNativeFactoryEntry)
     auto config = makeNativeGCSConfig();
 
 #if USE_GOOGLE_CLOUD
-    auto storage = ObjectStorageFactory::instance().create(
-        "native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true);
+    auto storage
+        = ObjectStorageFactory::instance().create("native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true);
 
     EXPECT_EQ(ObjectStorageType::GCS, storage->getType());
     EXPECT_NE(ObjectStorageType::S3, storage->getType());
@@ -199,13 +311,12 @@ TEST_F(GCSObjectStorageConfigTest, NativeGCSConfigKeepsTableFunctionGCSDefinitio
 
     auto config = makeNativeGCSConfig();
 #if USE_GOOGLE_CLOUD
-    auto storage = ObjectStorageFactory::instance().create(
-        "native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true);
+    auto storage
+        = ObjectStorageFactory::instance().create("native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true);
     EXPECT_EQ(ObjectStorageType::GCS, storage->getType());
 #else
     EXPECT_THROW(
-        ObjectStorageFactory::instance().create(
-            "native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true),
+        ObjectStorageFactory::instance().create("native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true),
         Exception);
 #endif
 }
@@ -216,8 +327,7 @@ TEST_F(GCSObjectStorageConfigTest, NativeGCSConfigRequiresBucket)
     config->remove("disk.bucket");
 
     EXPECT_THROW(
-        ObjectStorageFactory::instance().create(
-            "native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true),
+        ObjectStorageFactory::instance().create("native_gcs_disk", *config, "disk", getContext().context, /* skip_access_check */ true),
         Exception);
 }
 
@@ -546,8 +656,7 @@ TEST(GCSObjectStorageCore, ReadOnlyRejectsWritesAndInvalidNames)
     auto fake_stub = std::make_shared<GCS::FakeStub>();
     auto read_only_storage = makeFakeGCSObjectStorage(fake_stub, true);
     EXPECT_THROW(
-        read_only_storage->writeObject(StoredObject("clickhouse-data/read-only", "read-only"), WriteMode::Rewrite, {}, 4, {}),
-        Exception);
+        read_only_storage->writeObject(StoredObject("clickhouse-data/read-only", "read-only"), WriteMode::Rewrite, {}, 4, {}), Exception);
 
     auto storage = makeFakeGCSObjectStorage(fake_stub);
     EXPECT_THROW(storage->writeObject(StoredObject("/absolute", "absolute"), WriteMode::Rewrite, {}, 4, {}), Exception);
@@ -576,6 +685,199 @@ TEST(GCSObjectStorageCore, DeleteNotFoundAndMultiDelete)
     EXPECT_FALSE(storage->exists(second));
     EXPECT_FALSE(storage->exists(missing));
 }
+TEST(GCSObjectStorageObservability, ProfileEventsForDiskOperationsAndBuffers)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    auto object = writeFakeObject(storage, "clickhouse-data/observability", "payload");
+
+    EXPECT_TRUE(storage->exists(object));
+
+    RelativePathsWithMetadata children;
+    storage->listObjects("clickhouse-data/", children, 10);
+    EXPECT_EQ(1, children.size());
+
+    auto in = storage->readObject(object, readSettings(16), {});
+    EXPECT_EQ("payload", readAll(*in));
+
+    storage->removeObjectIfExists(object);
+
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSGetObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSGetObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSListObjects));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSListObjects));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSDeleteObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSDeleteObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSReadObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteObject));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSWriteObject));
+    EXPECT_EQ(7, profileEventValue(ProfileEvents::ReadBufferFromGCSBytes));
+    EXPECT_EQ(7, profileEventValue(ProfileEvents::WriteBufferFromGCSBytes));
+    EXPECT_GT(profileEventValue(ProfileEvents::ReadBufferFromGCSInitMicroseconds), 0);
+    EXPECT_GT(profileEventValue(ProfileEvents::ReadBufferFromGCSMicroseconds), 0);
+    EXPECT_GT(profileEventValue(ProfileEvents::WriteBufferFromGCSMicroseconds), 0);
+}
+
+TEST(GCSObjectStorageObservability, ReadAndWriteBufferFailuresAccountErrors)
+{
+    {
+        resetProfileEvents();
+
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        fake_stub->use_object_map = false;
+
+        google::storage::v2::ReadObjectResponse response;
+        response.mutable_checksummed_data()->set_content("abc");
+        fake_stub->read_object_responses = {response};
+        fake_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "unavailable");
+
+        auto in = storage->readObject(StoredObject("clickhouse-data/read-fails", "read-fails", 3), readSettings(4), {});
+        EXPECT_THROW(readAll(*in), Exception);
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadRequestsErrors));
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSReadRequestsErrors));
+    }
+
+    {
+        resetProfileEvents();
+
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        fake_stub->use_object_map = false;
+        fake_stub->write_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "finish failed");
+
+        auto out = storage->writeObject(StoredObject("clickhouse-data/write-fails", "write-fails"), WriteMode::Rewrite, {}, 4, {});
+        writeString("abc", *out);
+        EXPECT_THROW(out->finalize(), Exception);
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::WriteBufferFromGCSRequestsErrors));
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestsErrors));
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSWriteRequestsErrors));
+    }
+}
+
+TEST(GCSObjectStorageObservability, RetryThrottleAndRequestThrottlerEventsReachDiskPath)
+{
+    resetProfileEvents();
+
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    addFakeObject(fake_stub, "clickhouse-data/retry", "payload");
+    fake_stub->get_object_statuses = {grpc::Status(grpc::StatusCode::UNAVAILABLE, "temporarily unavailable")};
+    fake_stub->list_objects_statuses = {grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "quota exhausted")};
+
+    GCS::ClientSettings client_settings;
+    client_settings.max_retry_attempts = 2;
+    client_settings.request_throttler.get_throttler
+        = blockingThrottler(ProfileEvents::GCSGetRequestThrottlerCount, ProfileEvents::GCSGetRequestThrottlerSleepMicroseconds);
+    client_settings.request_throttler.put_throttler
+        = blockingThrottler(ProfileEvents::GCSPutRequestThrottlerCount, ProfileEvents::GCSPutRequestThrottlerSleepMicroseconds);
+
+    auto storage = makeFakeGCSObjectStorage(fake_stub, false, std::move(client_settings));
+    EXPECT_TRUE(storage->exists(StoredObject("clickhouse-data/retry", "retry", 7)));
+
+    RelativePathsWithMetadata children;
+    storage->listObjects("clickhouse-data/", children, 10);
+    EXPECT_EQ(1, children.size());
+
+    EXPECT_EQ(2, fake_stub->get_object_requests.size());
+    EXPECT_EQ(2, fake_stub->list_objects_requests.size());
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSReadRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSReadRequestsErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSReadRequestsErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSWriteRequestRetryableErrors));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestsThrottling));
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSWriteRequestsThrottling));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSGetRequestThrottlerCount));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::DiskGCSGetRequestThrottlerCount));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::GCSPutRequestThrottlerCount));
+    EXPECT_EQ(2, profileEventValue(ProfileEvents::DiskGCSPutRequestThrottlerCount));
+    EXPECT_GT(profileEventValue(ProfileEvents::GCSGetRequestThrottlerSleepMicroseconds), 0);
+    EXPECT_GT(profileEventValue(ProfileEvents::DiskGCSGetRequestThrottlerSleepMicroseconds), 0);
+    EXPECT_GT(profileEventValue(ProfileEvents::GCSPutRequestThrottlerSleepMicroseconds), 0);
+    EXPECT_GT(profileEventValue(ProfileEvents::DiskGCSPutRequestThrottlerSleepMicroseconds), 0);
+}
+
+TEST(GCSObjectStorageObservability, BlobStorageLogRowsCaptureReadUploadDeleteAndErrors)
+{
+    CapturedBlobStorageLog captured_log;
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage
+        = makeFakeGCSObjectStorage(fake_stub, false, {}, [&](const String & disk_name) { return captured_log.createWriter(disk_name); });
+
+    StoredObject object("clickhouse-data/blob-log", "local/blob-log", 7);
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, {}, 4, {});
+        writeString("payload", *out);
+        out->finalize();
+    }
+
+    auto read_settings = readSettings(16);
+    read_settings.enable_blob_storage_log_for_read_operations = true;
+    auto in = storage->readObject(object, read_settings, {});
+    EXPECT_EQ("payload", readAll(*in));
+
+    storage->removeObjectIfExists(object);
+
+    fake_stub->use_object_map = false;
+    fake_stub->read_object_responses.clear();
+    fake_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::NOT_FOUND, "missing");
+    auto failed_in = storage->readObject(StoredObject("clickhouse-data/missing", "local/missing", 3), read_settings, {});
+    EXPECT_THROW(readAll(*failed_in), Exception);
+
+    auto logs = captured_log.drain();
+    ASSERT_GE(logs.size(), 4);
+
+    const auto find_log = [&](BlobStorageLogElement::EventType event_type, const String & remote_path) -> const BlobStorageLogElement *
+    {
+        for (const auto & log : logs)
+        {
+            if (log.event_type == event_type && log.remote_path == remote_path)
+                return &log;
+        }
+        return nullptr;
+    };
+
+    const auto * upload = find_log(BlobStorageLogElement::EventType::Upload, "clickhouse-data/blob-log");
+    ASSERT_NE(nullptr, upload);
+    EXPECT_EQ("native_gcs_disk", upload->disk_name);
+    EXPECT_EQ("native-bucket", upload->bucket);
+    EXPECT_EQ("local/blob-log", upload->local_path);
+    EXPECT_EQ(7, upload->data_size);
+    EXPECT_EQ(0, upload->error_code);
+    EXPECT_GT(upload->elapsed_microseconds, 0);
+
+    const auto * read = find_log(BlobStorageLogElement::EventType::Read, "clickhouse-data/blob-log");
+    ASSERT_NE(nullptr, read);
+    EXPECT_EQ("native_gcs_disk", read->disk_name);
+    EXPECT_EQ("native-bucket", read->bucket);
+    EXPECT_EQ("local/blob-log", read->local_path);
+    EXPECT_EQ(7, read->data_size);
+    EXPECT_EQ(0, read->error_code);
+    EXPECT_GT(read->elapsed_microseconds, 0);
+
+    const auto * delete_log = find_log(BlobStorageLogElement::EventType::Delete, "clickhouse-data/blob-log");
+    ASSERT_NE(nullptr, delete_log);
+    EXPECT_EQ("native_gcs_disk", delete_log->disk_name);
+    EXPECT_EQ("native-bucket", delete_log->bucket);
+    EXPECT_EQ("local/blob-log", delete_log->local_path);
+    EXPECT_EQ(7, delete_log->data_size);
+    EXPECT_EQ(0, delete_log->error_code);
+    EXPECT_GT(delete_log->elapsed_microseconds, 0);
+
+    const auto * failed_read = find_log(BlobStorageLogElement::EventType::Read, "clickhouse-data/missing");
+    ASSERT_NE(nullptr, failed_read);
+    EXPECT_EQ("native_gcs_disk", failed_read->disk_name);
+    EXPECT_EQ("native-bucket", failed_read->bucket);
+    EXPECT_EQ("local/missing", failed_read->local_path);
+    EXPECT_EQ(3, failed_read->data_size);
+    EXPECT_NE(0, failed_read->error_code);
+    EXPECT_NE(std::string::npos, failed_read->error_message.find("NotFound"));
+}
 
 
 TEST(GCSObjectStorageCore, FakeDiskObjectStorageLocalMetadataScenario)
@@ -601,13 +903,7 @@ TEST(GCSObjectStorageCore, FakeDiskObjectStorageLocalMetadataScenario)
     auto object_storages = std::make_shared<ObjectStorageRouter>(std::move(object_storage_registry));
     Poco::AutoPtr<Poco::Util::XMLConfiguration> config(new Poco::Util::XMLConfiguration());
     auto disk = std::make_shared<DiskObjectStorage>(
-        "native_gcs",
-        std::move(cluster),
-        std::move(metadata_storage),
-        std::move(object_storages),
-        nullptr,
-        *config,
-        "");
+        "native_gcs", std::move(cluster), std::move(metadata_storage), std::move(object_storages), nullptr, *config, "");
 
     disk->createDirectory("dir");
     {

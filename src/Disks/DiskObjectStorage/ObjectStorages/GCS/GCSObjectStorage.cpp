@@ -5,10 +5,13 @@
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/copyData.h>
 #include <Interpreters/Context.h>
+#include <Common/BlobStorageLogWriter.h>
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/Macros.h>
 #include <Common/ObjectStorageKeyGenerator.h>
 #include <Common/ProfileEvents.h>
+#include <Common/Stopwatch.h>
 #include <Common/Throttler.h>
 
 #include <fmt/format.h>
@@ -25,6 +28,13 @@ extern const Event GCSGetRequestThrottlerCount;
 extern const Event GCSGetRequestThrottlerSleepMicroseconds;
 extern const Event GCSPutRequestThrottlerCount;
 extern const Event GCSPutRequestThrottlerSleepMicroseconds;
+extern const Event ReadBufferFromGCSMicroseconds;
+extern const Event ReadBufferFromGCSInitMicroseconds;
+extern const Event ReadBufferFromGCSBytes;
+extern const Event ReadBufferFromGCSRequestsErrors;
+extern const Event WriteBufferFromGCSMicroseconds;
+extern const Event WriteBufferFromGCSBytes;
+extern const Event WriteBufferFromGCSRequestsErrors;
 }
 
 namespace DB
@@ -105,15 +115,32 @@ std::string cordToString(const absl::Cord & cord)
     return result;
 }
 
+String statusLogMessage(const GCS::Status & status)
+{
+    if (status.ok())
+        return {};
+    if (status.message.empty())
+        return GCS::statusCodeName(status.code);
+    return fmt::format("{}: {}", GCS::statusCodeName(status.code), status.message);
+}
+
 class GCSReadBuffer final : public ReadBufferFromFileBase
 {
 public:
     GCSReadBuffer(
-        std::shared_ptr<GCS::Client> client_, String bucket_, String object_name_, size_t buf_size, std::optional<size_t> file_size_)
+        std::shared_ptr<GCS::Client> client_,
+        String bucket_,
+        String object_name_,
+        size_t buf_size,
+        std::optional<size_t> file_size_,
+        ThrottlerPtr remote_throttler_,
+        BlobStorageLogWriterPtr blob_storage_log_)
         : ReadBufferFromFileBase(buf_size, nullptr, 0, file_size_)
         , client(std::move(client_))
         , bucket(std::move(bucket_))
         , object_name(std::move(object_name_))
+        , remote_throttler(std::move(remote_throttler_))
+        , blob_storage_log(std::move(blob_storage_log_))
     {
     }
 
@@ -187,29 +214,83 @@ private:
         if (limit == 0)
             return {};
 
-        google::storage::v2::ReadObjectRequest request;
-        request.set_bucket(bucketResourceName(bucket));
-        request.set_object(object_name);
-        request.set_read_offset(static_cast<int64_t>(offset));
-        request.set_read_limit(static_cast<int64_t>(limit));
+        Stopwatch watch;
+        Int32 error_code = 0;
+        String error_message;
 
-        auto stream_result = client->readObject(request);
-        GCS::throwIfError(stream_result.status, "ReadObject");
-
-        String data;
-        google::storage::v2::ReadObjectResponse response;
-        while (stream_result.stream->Read(&response))
+        const auto add_blob_log_event = [&](size_t data_size, Int32 code, const String & message)
         {
-            if (response.has_checksummed_data())
-                data += cordToString(response.checksummed_data().content());
+            if (blob_storage_log)
+                blob_storage_log->addEvent(
+                    BlobStorageLogElement::EventType::Read, bucket, object_name, {}, data_size, watch.elapsedMicroseconds(), code, message);
+        };
+
+        try
+        {
+            CurrentThread::ReadThrottlingScope read_throttling_scope(remote_throttler);
+
+            google::storage::v2::ReadObjectRequest request;
+            request.set_bucket(bucketResourceName(bucket));
+            request.set_object(object_name);
+            request.set_read_offset(static_cast<int64_t>(offset));
+            request.set_read_limit(static_cast<int64_t>(limit));
+
+            Stopwatch init_watch;
+            auto stream_result = client->readObject(request);
+            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSInitMicroseconds, init_watch.elapsedMicroseconds());
+            if (!stream_result.status.ok())
+            {
+                error_code = GCS::errorCodeForStatus(stream_result.status.code);
+                error_message = statusLogMessage(stream_result.status);
+                ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
+                add_blob_log_event(limit, error_code, error_message);
+                GCS::throwIfError(stream_result.status, "ReadObject");
+            }
+
+            String data;
+            google::storage::v2::ReadObjectResponse response;
+            while (stream_result.stream->Read(&response))
+            {
+                if (response.has_checksummed_data())
+                    data += cordToString(response.checksummed_data().content());
+            }
+
+            auto finish_status = GCS::fromGrpcStatus(stream_result.stream->Finish());
+            if (!finish_status.ok())
+            {
+                error_code = GCS::errorCodeForStatus(finish_status.code);
+                error_message = statusLogMessage(finish_status);
+                ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
+                add_blob_log_event(limit, error_code, error_message);
+                GCS::throwIfError(finish_status, "ReadObject");
+            }
+
+            if (remote_throttler && !data.empty())
+                remote_throttler->throttle(data.size());
+
+            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSBytes, data.size());
+            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSMicroseconds, watch.elapsedMicroseconds());
+            add_blob_log_event(data.size(), 0, {});
+            return data;
         }
-        GCS::throwIfError(GCS::fromGrpcStatus(stream_result.stream->Finish()), "ReadObject");
-        return data;
+        catch (...)
+        {
+            if (!error_code)
+            {
+                error_code = getCurrentExceptionCode();
+                error_message = getCurrentExceptionMessage(false);
+                ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
+                add_blob_log_event(limit, error_code, error_message);
+            }
+            throw;
+        }
     }
 
     std::shared_ptr<GCS::Client> client;
     String bucket;
     String object_name;
+    ThrottlerPtr remote_throttler;
+    BlobStorageLogWriterPtr blob_storage_log;
     size_t read_offset = 0;
 };
 
@@ -221,12 +302,16 @@ public:
         String bucket_,
         String object_name_,
         std::optional<ObjectAttributes> attributes_,
-        size_t buf_size)
+        size_t buf_size,
+        ThrottlerPtr remote_throttler_,
+        BlobStorageLogWriterPtr blob_storage_log_)
         : WriteBufferFromFileBase(buf_size, nullptr, 0)
         , client(std::move(client_))
         , bucket(std::move(bucket_))
         , object_name(std::move(object_name_))
         , attributes(std::move(attributes_))
+        , remote_throttler(std::move(remote_throttler_))
+        , blob_storage_log(std::move(blob_storage_log_))
     {
     }
 
@@ -251,12 +336,18 @@ private:
 
         response.emplace();
         stream_result.emplace(client->writeObject(*response, bucketResourceName(bucket)));
-        GCS::throwIfError(stream_result->status, "starting WriteObject");
+        if (!stream_result->status.ok())
+        {
+            recordUploadFailure(GCS::errorCodeForStatus(stream_result->status.code), statusLogMessage(stream_result->status));
+            GCS::throwIfError(stream_result->status, "starting WriteObject");
+        }
     }
 
     void sendChunks(const char * source, size_t size, bool finish)
     {
         ensureStream();
+
+        CurrentThread::WriteThrottlingScope write_throttling_scope(remote_throttler);
 
         size_t sent = 0;
         while (sent < size || (finish && sent == 0))
@@ -286,6 +377,14 @@ private:
             if (!stream_result->stream->Write(request, grpc::WriteOptions{}))
                 throwWriteFailure("sending");
 
+            if (chunk_size)
+            {
+                if (remote_throttler)
+                    remote_throttler->throttle(chunk_size);
+                ProfileEvents::increment(ProfileEvents::WriteBufferFromGCSBytes, chunk_size);
+                accepted_payload_bytes += chunk_size;
+            }
+
             write_offset += chunk_size;
             sent += chunk_size;
 
@@ -306,7 +405,48 @@ private:
             throwWriteFailure("finishing writes for");
 
         stream_finished = true;
-        GCS::throwIfError(GCS::fromGrpcStatus(stream_result->stream->Finish()), "WriteObject");
+        auto finish_status = GCS::fromGrpcStatus(stream_result->stream->Finish());
+        if (!finish_status.ok())
+        {
+            recordUploadFailure(GCS::errorCodeForStatus(finish_status.code), statusLogMessage(finish_status));
+            GCS::throwIfError(finish_status, "WriteObject");
+        }
+
+        recordUploadElapsed();
+        addUploadBlobLogEvent(0, {});
+    }
+
+    void recordUploadElapsed()
+    {
+        if (!upload_elapsed_recorded)
+        {
+            ProfileEvents::increment(ProfileEvents::WriteBufferFromGCSMicroseconds, upload_watch.elapsedMicroseconds());
+            upload_elapsed_recorded = true;
+        }
+    }
+
+    void addUploadBlobLogEvent(Int32 error_code, const String & error_message)
+    {
+        if (!blob_storage_log || upload_blob_log_written)
+            return;
+
+        blob_storage_log->addEvent(
+            BlobStorageLogElement::EventType::Upload,
+            bucket,
+            object_name,
+            {},
+            accepted_payload_bytes,
+            upload_watch.elapsedMicroseconds(),
+            error_code,
+            error_message);
+        upload_blob_log_written = true;
+    }
+
+    void recordUploadFailure(Int32 error_code, const String & error_message)
+    {
+        ProfileEvents::increment(ProfileEvents::WriteBufferFromGCSRequestsErrors);
+        recordUploadElapsed();
+        addUploadBlobLogEvent(error_code, error_message);
     }
 
     [[noreturn]] void throwWriteFailure(std::string_view action)
@@ -315,6 +455,8 @@ private:
         auto status = GCS::fromGrpcStatus(stream_result->stream->Finish());
         if (!status.ok())
         {
+            auto error_message = statusLogMessage(status);
+            recordUploadFailure(GCS::errorCodeForStatus(status.code), error_message);
             throw Exception(
                 GCS::errorCodeForStatus(status.code),
                 "GCS gRPC WriteObject failed while {} object '{}' at offset {} with {}: {}",
@@ -325,6 +467,7 @@ private:
                 status.message);
         }
 
+        recordUploadFailure(ErrorCodes::S3_ERROR, fmt::format("stream closed while {} object '{}'", action, object_name));
         throw Exception(
             ErrorCodes::S3_ERROR,
             "GCS gRPC WriteObject stream closed while {} object '{}' at offset {} without a final gRPC error status",
@@ -337,11 +480,17 @@ private:
     String bucket;
     String object_name;
     std::optional<ObjectAttributes> attributes;
+    ThrottlerPtr remote_throttler;
+    BlobStorageLogWriterPtr blob_storage_log;
+    Stopwatch upload_watch;
     std::optional<google::storage::v2::WriteObjectResponse> response;
     std::optional<GCS::StreamResult<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>>> stream_result;
     bool started = false;
     bool stream_finished = false;
+    bool upload_elapsed_recorded = false;
+    bool upload_blob_log_written = false;
     int64_t write_offset = 0;
+    size_t accepted_payload_bytes = 0;
 };
 
 }
@@ -379,8 +528,22 @@ GCSObjectStorage::readObject(const StoredObject & object, const ReadSettings & r
     if (object.bytes_size != std::numeric_limits<uint64_t>::max())
         file_size = static_cast<size_t>(object.bytes_size);
 
+    BlobStorageLogWriterPtr blob_storage_log;
+    if (read_settings.enable_blob_storage_log_for_read_operations)
+    {
+        blob_storage_log = createBlobStorageLogWriter();
+        if (blob_storage_log)
+            blob_storage_log->local_path = object.local_path;
+    }
+
     return std::make_unique<GCSReadBuffer>(
-        client, settings.bucket, objectName(object.remote_path), read_settings.remote_fs_buffer_size, file_size);
+        client,
+        settings.bucket,
+        objectName(object.remote_path),
+        read_settings.remote_fs_buffer_size,
+        file_size,
+        read_settings.remote_throttler,
+        std::move(blob_storage_log));
 #else
     (void)object;
     (void)read_settings;
@@ -389,7 +552,11 @@ GCSObjectStorage::readObject(const StoredObject & object, const ReadSettings & r
 }
 
 std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
-    const StoredObject & object, WriteMode mode, std::optional<ObjectAttributes> attributes, size_t buf_size, const WriteSettings &)
+    const StoredObject & object,
+    WriteMode mode,
+    std::optional<ObjectAttributes> attributes,
+    size_t buf_size,
+    const WriteSettings & write_settings)
 {
 #if USE_GOOGLE_CLOUD
     if (mode != WriteMode::Rewrite)
@@ -397,37 +564,69 @@ std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
     if (settings.read_only)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage disk '{}' is read-only", settings.disk_name);
 
-    return std::make_unique<GCSWriteBuffer>(client, settings.bucket, objectName(object.remote_path), std::move(attributes), buf_size);
+    auto blob_storage_log = createBlobStorageLogWriter();
+    if (blob_storage_log)
+        blob_storage_log->local_path = object.local_path;
+
+    return std::make_unique<GCSWriteBuffer>(
+        client,
+        settings.bucket,
+        objectName(object.remote_path),
+        std::move(attributes),
+        buf_size,
+        write_settings.remote_throttler,
+        std::move(blob_storage_log));
 #else
     (void)object;
     (void)mode;
     (void)attributes;
     (void)buf_size;
+    (void)write_settings;
     throwNotImplemented("writeObject");
 #endif
 }
 
 void GCSObjectStorage::removeObjectIfExists(const StoredObject & object)
 {
+    auto blob_storage_log = createBlobStorageLogWriter();
+    removeObjectIfExistsImpl(object, blob_storage_log);
+}
+
+void GCSObjectStorage::removeObjectIfExistsImpl(const StoredObject & object, const BlobStorageLogWriterPtr & blob_storage_log) const
+{
 #if USE_GOOGLE_CLOUD
     google::storage::v2::DeleteObjectRequest request;
     request.set_bucket(bucketResourceName(settings.bucket));
     request.set_object(objectName(object.remote_path));
 
+    Stopwatch watch;
     auto status = client->deleteObject(request);
+    if (blob_storage_log)
+        blob_storage_log->addEvent(
+            BlobStorageLogElement::EventType::Delete,
+            settings.bucket,
+            object.remote_path,
+            object.local_path,
+            object.bytes_size,
+            watch.elapsedMicroseconds(),
+            status.ok() ? 0 : GCS::errorCodeForStatus(status.code),
+            statusLogMessage(status));
+
     if (status.code == GCS::StatusCode::NotFound)
         return;
     GCS::throwIfError(status, "DeleteObject");
 #else
     (void)object;
+    (void)blob_storage_log;
     throwNotImplemented("removeObjectIfExists");
 #endif
 }
 
 void GCSObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
 {
+    auto blob_storage_log = createBlobStorageLogWriter();
     for (const auto & object : objects)
-        removeObjectIfExists(object);
+        removeObjectIfExistsImpl(object, blob_storage_log);
 }
 
 void GCSObjectStorage::copyObject(
@@ -579,6 +778,13 @@ WriteSettings GCSObjectStorage::patchSettings(const WriteSettings & write_settin
 ObjectStorageKeyGeneratorPtr GCSObjectStorage::createKeyGenerator() const
 {
     return createObjectStorageKeyGeneratorByPrefix(settings.key_prefix);
+}
+
+BlobStorageLogWriterPtr GCSObjectStorage::createBlobStorageLogWriter() const
+{
+    if (settings.blob_storage_log_writer_factory)
+        return settings.blob_storage_log_writer_factory(settings.disk_name);
+    return BlobStorageLogWriter::create(settings.disk_name);
 }
 
 void GCSObjectStorage::throwNotImplemented(std::string_view operation) const
