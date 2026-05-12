@@ -86,6 +86,10 @@ extern const Event ReadBufferFromGCSRequestsErrors;
 extern const Event WriteBufferFromGCSMicroseconds;
 extern const Event WriteBufferFromGCSBytes;
 extern const Event WriteBufferFromGCSRequestsErrors;
+extern const Event RemoteReadThrottlerBytes;
+extern const Event RemoteReadThrottlerSleepMicroseconds;
+extern const Event RemoteWriteThrottlerBytes;
+extern const Event RemoteWriteThrottlerSleepMicroseconds;
 }
 
 using namespace DB;
@@ -691,7 +695,16 @@ TEST(GCSObjectStorageObservability, ProfileEventsForDiskOperationsAndBuffers)
 
     auto fake_stub = std::make_shared<GCS::FakeStub>();
     auto storage = makeFakeGCSObjectStorage(fake_stub);
-    auto object = writeFakeObject(storage, "clickhouse-data/observability", "payload");
+    StoredObject object("clickhouse-data/observability", "clickhouse-data/observability", 7);
+
+    WriteSettings write_settings;
+    write_settings.remote_throttler
+        = blockingThrottler(ProfileEvents::RemoteWriteThrottlerBytes, ProfileEvents::RemoteWriteThrottlerSleepMicroseconds);
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, {}, 4, write_settings);
+        writeString("payload", *out);
+        out->finalize();
+    }
 
     EXPECT_TRUE(storage->exists(object));
 
@@ -699,7 +712,10 @@ TEST(GCSObjectStorageObservability, ProfileEventsForDiskOperationsAndBuffers)
     storage->listObjects("clickhouse-data/", children, 10);
     EXPECT_EQ(1, children.size());
 
-    auto in = storage->readObject(object, readSettings(16), {});
+    auto read_settings = readSettings(16);
+    read_settings.remote_throttler
+        = blockingThrottler(ProfileEvents::RemoteReadThrottlerBytes, ProfileEvents::RemoteReadThrottlerSleepMicroseconds);
+    auto in = storage->readObject(object, read_settings, {});
     EXPECT_EQ("payload", readAll(*in));
 
     storage->removeObjectIfExists(object);
@@ -716,6 +732,10 @@ TEST(GCSObjectStorageObservability, ProfileEventsForDiskOperationsAndBuffers)
     EXPECT_EQ(1, profileEventValue(ProfileEvents::DiskGCSWriteObject));
     EXPECT_EQ(7, profileEventValue(ProfileEvents::ReadBufferFromGCSBytes));
     EXPECT_EQ(7, profileEventValue(ProfileEvents::WriteBufferFromGCSBytes));
+    EXPECT_EQ(7, profileEventValue(ProfileEvents::RemoteReadThrottlerBytes));
+    EXPECT_GT(profileEventValue(ProfileEvents::RemoteReadThrottlerSleepMicroseconds), 0);
+    EXPECT_EQ(7, profileEventValue(ProfileEvents::RemoteWriteThrottlerBytes));
+    EXPECT_GT(profileEventValue(ProfileEvents::RemoteWriteThrottlerSleepMicroseconds), 0);
     EXPECT_GT(profileEventValue(ProfileEvents::ReadBufferFromGCSInitMicroseconds), 0);
     EXPECT_GT(profileEventValue(ProfileEvents::ReadBufferFromGCSMicroseconds), 0);
     EXPECT_GT(profileEventValue(ProfileEvents::WriteBufferFromGCSMicroseconds), 0);
