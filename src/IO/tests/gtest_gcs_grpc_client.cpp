@@ -181,7 +181,6 @@ std::string fakeObjectKey(const std::string & bucket, const std::string & name)
     return bucket + "\n" + name;
 }
 
-}
 
 TEST(GCSGrpcClientFoundation, GrpcStatusIncludesDetailsAndNumericCode)
 {
@@ -712,12 +711,14 @@ TEST(GCSGrpcClientFoundation, WriteStreamFailureAfterPayloadIsNotReplayed)
 
     auto finish_status = stream.stream->Finish();
     EXPECT_FALSE(finish_status.ok());
-    EXPECT_EQ(1, fake_stub->write_object_stream_creations);
-    EXPECT_EQ(1, fake_stub->write_object_finish_calls);
+    EXPECT_EQ(1, fake_stub->write_object_stream_creations.load());
+    EXPECT_EQ(1, fake_stub->write_object_finish_calls.load());
     EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteObject));
     EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestAttempts));
     EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestRetryableErrors));
     EXPECT_EQ(1, profileEventValue(ProfileEvents::GCSWriteRequestsErrors));
     EXPECT_EQ(0, profileEventValue(ProfileEvents::GCSWriteRequestsThrottling));
+}
+
 }
 #endif

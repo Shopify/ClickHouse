@@ -6,10 +6,12 @@
 #include <config.h>
 #include <base/types.h>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #if USE_GOOGLE_CLOUD
@@ -166,7 +168,7 @@ public:
         FinishCallback finish_callback_ = {},
         bool write_returns_false_ = false,
         bool writes_done_returns_false_ = false,
-        int * finish_calls_ = nullptr);
+        std::atomic_int * finish_calls_ = nullptr);
 
     void WaitForInitialMetadata() { }
     bool Write(const google::storage::v2::WriteObjectRequest & message, grpc::WriteOptions options) override;
@@ -184,7 +186,7 @@ private:
     bool writes_done = false;
     bool write_returns_false = false;
     bool writes_done_returns_false = false;
-    int * finish_calls = nullptr;
+    std::atomic_int * finish_calls = nullptr;
 };
 
 class FakeStub final : public IStub
@@ -217,10 +219,11 @@ public:
     size_t write_object_null_streams = 0;
     bool write_object_write_returns_false = false;
     bool write_object_writes_done_returns_false = false;
-    int write_object_finish_calls = 0;
-    int write_object_stream_creations = 0;
+    std::atomic_int write_object_finish_calls = 0;
+    std::atomic_int write_object_stream_creations = 0;
     bool use_object_map = false;
     std::map<std::string, FakeObject> objects;
+    std::mutex mutex;
 
     std::vector<google::storage::v2::GetObjectRequest> get_object_requests;
     std::vector<google::storage::v2::ListObjectsRequest> list_objects_requests;

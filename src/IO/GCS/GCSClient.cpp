@@ -783,7 +783,7 @@ FakeWriteStream::FakeWriteStream(
     FinishCallback finish_callback_,
     bool write_returns_false_,
     bool writes_done_returns_false_,
-    int * finish_calls_)
+    std::atomic_int * finish_calls_)
     : response_out(response_out_)
     , response(std::move(response_))
     , finish_status(std::move(finish_status_))
@@ -957,11 +957,15 @@ grpc::Status FakeStub::composeObject(
             data += it->second.data;
         }
 
+        const auto destination_key = fakeObjectKey(request.destination().bucket(), request.destination().name());
+        if (request.has_if_generation_match() && request.if_generation_match() == 0 && objects.contains(destination_key))
+            return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "fake compose destination already exists");
+
         FakeObject object;
         object.data = std::move(data);
         object.metadata = request.destination();
         object.metadata.set_size(static_cast<int64_t>(object.data.size()));
-        objects[fakeObjectKey(object.metadata.bucket(), object.metadata.name())] = object;
+        objects[destination_key] = object;
         response = object.metadata;
         return grpc::Status::OK;
     }
@@ -1052,21 +1056,35 @@ FakeStub::readObject(grpc::ClientContext & context, const google::storage::v2::R
 std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>>
 FakeStub::writeObject(grpc::ClientContext & context, google::storage::v2::WriteObjectResponse & response)
 {
-    last_deadline = context.deadline();
-    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
-    ++write_object_stream_creations;
-    response = write_object_response;
+    google::storage::v2::WriteObjectResponse response_template;
+    grpc::Status finish_status;
+    bool write_returns_false = false;
+    bool writes_done_returns_false = false;
 
-    if (write_object_null_streams > 0)
     {
-        --write_object_null_streams;
-        return nullptr;
+        std::lock_guard lock(mutex);
+        last_deadline = context.deadline();
+        last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
+        ++write_object_stream_creations;
+        response = write_object_response;
+
+        if (write_object_null_streams > 0)
+        {
+            --write_object_null_streams;
+            return nullptr;
+        }
+
+        response_template = write_object_response;
+        finish_status = write_object_finish_status;
+        write_returns_false = write_object_write_returns_false;
+        writes_done_returns_false = write_object_writes_done_returns_false;
     }
 
     auto finish_callback =
         [this](
             const std::vector<google::storage::v2::WriteObjectRequest> & writes, google::storage::v2::WriteObjectResponse & write_response)
     {
+        std::lock_guard lock(mutex);
         write_object_requests.insert(write_object_requests.end(), writes.begin(), writes.end());
 
         if (!use_object_map)
@@ -1083,22 +1101,27 @@ FakeStub::writeObject(grpc::ClientContext & context, google::storage::v2::WriteO
                 data += cordToString(write.checksummed_data().content());
         }
 
+        const auto object_key = fakeObjectKey(resource.bucket(), resource.name());
+        const auto & spec = writes.front().write_object_spec();
+        if (spec.has_if_generation_match() && spec.if_generation_match() == 0 && objects.contains(object_key))
+            return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "fake write destination already exists");
+
         FakeObject object;
         object.data = std::move(data);
         object.metadata = resource;
         object.metadata.set_size(static_cast<int64_t>(object.data.size()));
-        objects[fakeObjectKey(resource.bucket(), resource.name())] = object;
+        objects[object_key] = object;
         *write_response.mutable_resource() = object.metadata;
         return grpc::Status::OK;
     };
 
     return std::make_unique<FakeWriteStream>(
         &response,
-        write_object_response,
-        write_object_finish_status,
+        response_template,
+        finish_status,
         std::move(finish_callback),
-        write_object_write_returns_false,
-        write_object_writes_done_returns_false,
+        write_returns_false,
+        writes_done_returns_false,
         &write_object_finish_calls);
 }
 

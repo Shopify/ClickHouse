@@ -74,7 +74,7 @@ public:
 
     void shutdown() override { }
     void startup() override { }
-    bool supportParallelWrite() const override { return false; }
+    bool supportParallelWrite() const override { return true; }
     ReadSettings patchSettings(const ReadSettings & read_settings) const override;
     WriteSettings patchSettings(const WriteSettings & write_settings) const override;
 

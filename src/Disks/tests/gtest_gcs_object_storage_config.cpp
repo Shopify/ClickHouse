@@ -233,6 +233,11 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
         settings, std::make_shared<GCS::Client>(settings.client_settings, fake_stub, std::move(auth)));
 }
 
+String fakeObjectMapKey(const String & path)
+{
+    return "projects/_/buckets/native-bucket\n" + path;
+}
+
 void addFakeObject(const std::shared_ptr<GCS::FakeStub> & fake_stub, const String & path, const String & data = {})
 {
     GCS::FakeStub::FakeObject object;
@@ -826,7 +831,7 @@ TEST(GCSObjectStorageWriteBuffer, RepeatedSyncAndFinalize)
     writeString("def", *out);
     out->finalize();
 
-    EXPECT_EQ(1, fake_stub->write_object_finish_calls);
+    EXPECT_EQ(1, fake_stub->write_object_finish_calls.load());
     ASSERT_EQ(2, fake_stub->write_object_requests.size());
     EXPECT_EQ(0, fake_stub->write_object_requests[0].write_offset());
     EXPECT_FALSE(fake_stub->write_object_requests[0].finish_write());
@@ -845,7 +850,7 @@ TEST(GCSObjectStorageWriteBuffer, WriteFalseReportsFinishStatus)
     auto out = storage->writeObject(StoredObject("clickhouse-data/write-false", "write-false"), WriteMode::Rewrite, {}, 4, {});
     writeString("abc", *out);
     EXPECT_THROW(out->finalize(), Exception);
-    EXPECT_EQ(1, fake_stub->write_object_finish_calls);
+    EXPECT_EQ(1, fake_stub->write_object_finish_calls.load());
 }
 
 TEST(GCSObjectStorageWriteBuffer, WritesDoneAndFinishFailures)
@@ -859,7 +864,7 @@ TEST(GCSObjectStorageWriteBuffer, WritesDoneAndFinishFailures)
         auto out = storage->writeObject(StoredObject("clickhouse-data/writes-done", "writes-done"), WriteMode::Rewrite, {}, 4, {});
         writeString("abc", *out);
         EXPECT_THROW(out->finalize(), Exception);
-        EXPECT_EQ(1, fake_stub->write_object_finish_calls);
+        EXPECT_EQ(1, fake_stub->write_object_finish_calls.load());
     }
 
     for (auto code : {grpc::StatusCode::PERMISSION_DENIED, grpc::StatusCode::UNAVAILABLE, grpc::StatusCode::INVALID_ARGUMENT})
@@ -872,7 +877,195 @@ TEST(GCSObjectStorageWriteBuffer, WritesDoneAndFinishFailures)
         auto out = storage->writeObject(StoredObject("clickhouse-data/finish-fails", "finish-fails"), WriteMode::Rewrite, {}, 4, {});
         writeString("abc", *out);
         EXPECT_THROW(out->finalize(), Exception);
-        EXPECT_EQ(1, fake_stub->write_object_finish_calls);
+        EXPECT_EQ(1, fake_stub->write_object_finish_calls.load());
+    }
+}
+
+TEST(GCSObjectStorageWriteBuffer, ParallelComposeWritesLargeObjects)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    EXPECT_TRUE(storage->supportParallelWrite());
+
+    const size_t max_chunk = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
+    String payload(max_chunk * 2 + 1, 'x');
+    StoredObject object("clickhouse-data/parallel-write", "parallel-write", payload.size());
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, ObjectAttributes{{"owner", "clickhouse"}}, max_chunk, {});
+        writeString(payload, *out);
+        out->finalize();
+    }
+
+    ASSERT_TRUE(fake_stub->objects.contains(fakeObjectMapKey(object.remote_path)));
+    EXPECT_EQ(payload, fake_stub->objects.at(fakeObjectMapKey(object.remote_path)).data);
+    ASSERT_EQ(1, fake_stub->compose_object_requests.size());
+    const auto & compose_request = fake_stub->compose_object_requests.front();
+    EXPECT_EQ(object.remote_path, compose_request.destination().name());
+    EXPECT_EQ("clickhouse", compose_request.destination().metadata().at("owner"));
+    EXPECT_GE(compose_request.source_objects_size(), 2);
+    EXPECT_LE(compose_request.source_objects_size(), 32);
+    EXPECT_GE(fake_stub->write_object_stream_creations.load(), 2);
+    EXPECT_GE(fake_stub->delete_object_requests.size(), 2);
+    for (const auto & source : compose_request.source_objects())
+    {
+        EXPECT_TRUE(source.name().starts_with(object.remote_path + ".clickhouse-gcs-compose-tmp/"));
+        EXPECT_NE(object.remote_path, source.name());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(source.name())));
+    }
+}
+
+TEST(GCSObjectStorageWriteBuffer, SyncAfterParallelModeKeepsComposedData)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+
+    const size_t max_chunk = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
+    String payload(max_chunk * 3, 's');
+    payload += "tail";
+
+    StoredObject object("clickhouse-data/sync-after-parallel", "sync-after-parallel", payload.size());
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, {}, max_chunk, {});
+        out->write(payload.data(), max_chunk * 3);
+        writeString("tail", *out);
+        out->sync();
+        out->finalize();
+    }
+
+    ASSERT_TRUE(fake_stub->objects.contains(fakeObjectMapKey(object.remote_path)));
+    EXPECT_EQ(payload, fake_stub->objects.at(fakeObjectMapKey(object.remote_path)).data);
+    EXPECT_FALSE(fake_stub->compose_object_requests.empty());
+    EXPECT_GE(fake_stub->delete_object_requests.size(), 3);
+}
+
+TEST(GCSObjectStorageWriteBuffer, ParallelComposeTreeHandlesMoreThanThirtyTwoSources)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+
+    const size_t max_chunk = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
+    String payload(max_chunk * 33 + 1, 't');
+
+    StoredObject object("clickhouse-data/compose-tree", "compose-tree", payload.size());
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, {}, max_chunk, {});
+        writeString(payload, *out);
+        out->finalize();
+    }
+
+    ASSERT_TRUE(fake_stub->objects.contains(fakeObjectMapKey(object.remote_path)));
+    EXPECT_EQ(payload, fake_stub->objects.at(fakeObjectMapKey(object.remote_path)).data);
+    ASSERT_GE(fake_stub->compose_object_requests.size(), 2);
+    for (const auto & compose_request : fake_stub->compose_object_requests)
+        EXPECT_LE(compose_request.source_objects_size(), 32);
+    EXPECT_EQ(object.remote_path, fake_stub->compose_object_requests.back().destination().name());
+    EXPECT_GT(fake_stub->delete_object_requests.size(), 32);
+}
+
+TEST(GCSObjectStorageWriteBuffer, ParallelUploadCanBeDisabled)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+
+    WriteSettings write_settings;
+    write_settings.s3_allow_parallel_part_upload = false;
+    String payload = "abcdefghijkl";
+    StoredObject object("clickhouse-data/single-stream-disabled", "single-stream-disabled", payload.size());
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, {}, 4, write_settings);
+        writeString(payload, *out);
+        out->finalize();
+    }
+
+    EXPECT_TRUE(fake_stub->compose_object_requests.empty());
+    EXPECT_EQ(1, fake_stub->write_object_stream_creations.load());
+    ASSERT_TRUE(fake_stub->objects.contains(fakeObjectMapKey(object.remote_path)));
+    EXPECT_EQ(payload, fake_stub->objects.at(fakeObjectMapKey(object.remote_path)).data);
+}
+
+TEST(GCSObjectStorageWriteBuffer, ParallelComposeMetadataAndPreconditions)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+
+    const size_t max_chunk = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
+    String payload(max_chunk * 2 + 1, 'p');
+    WriteSettings write_settings;
+    write_settings.object_storage_write_if_none_match = "*";
+    StoredObject object("clickhouse-data/precondition-compose", "precondition-compose", payload.size());
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, ObjectAttributes{{"owner", "clickhouse"}}, max_chunk, write_settings);
+        writeString(payload, *out);
+        out->finalize();
+    }
+
+    ASSERT_FALSE(fake_stub->compose_object_requests.empty());
+    const auto & final_compose = fake_stub->compose_object_requests.back();
+    EXPECT_EQ(object.remote_path, final_compose.destination().name());
+    EXPECT_EQ("clickhouse", final_compose.destination().metadata().at("owner"));
+    EXPECT_TRUE(final_compose.has_if_generation_match());
+    EXPECT_EQ(0, final_compose.if_generation_match());
+
+    {
+        auto out = storage->writeObject(object, WriteMode::Rewrite, {}, max_chunk, write_settings);
+        writeString(payload, *out);
+        EXPECT_THROW(out->finalize(), Exception);
+    }
+
+    WriteSettings if_match_settings;
+    if_match_settings.object_storage_write_if_match = "etag";
+    EXPECT_THROW(
+        storage->writeObject(StoredObject("clickhouse-data/if-match", "if-match"), WriteMode::Rewrite, {}, 4, if_match_settings),
+        Exception);
+
+    WriteSettings unsupported_none_match;
+    unsupported_none_match.object_storage_write_if_none_match = "etag";
+    EXPECT_THROW(
+        storage->writeObject(
+            StoredObject("clickhouse-data/if-none-match-etag", "if-none-match-etag"),
+            WriteMode::Rewrite,
+            {},
+            4,
+            unsupported_none_match),
+        Exception);
+}
+
+TEST(GCSObjectStorageWriteBuffer, ParallelComposeFailuresCleanupTemps)
+{
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        fake_stub->compose_object_status = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "compose failed");
+
+        const size_t max_chunk = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
+        String payload(max_chunk * 2 + 1, 'c');
+        StoredObject object("clickhouse-data/compose-fails", "compose-fails", payload.size());
+        {
+            auto out = storage->writeObject(object, WriteMode::Rewrite, {}, max_chunk, {});
+            writeString(payload, *out);
+            EXPECT_THROW(out->finalize(), Exception);
+        }
+
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(object.remote_path)));
+        EXPECT_FALSE(fake_stub->delete_object_requests.empty());
+    }
+
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        fake_stub->write_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "finish failed");
+
+        const size_t max_chunk = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
+        String payload(max_chunk * 2 + 1, 'u');
+        StoredObject object("clickhouse-data/chunk-fails", "chunk-fails", payload.size());
+        {
+            auto out = storage->writeObject(object, WriteMode::Rewrite, {}, max_chunk, {});
+            writeString(payload, *out);
+            EXPECT_THROW(out->finalize(), Exception);
+        }
+
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(object.remote_path)));
+        EXPECT_TRUE(fake_stub->delete_object_requests.empty());
     }
 }
 
