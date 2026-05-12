@@ -365,6 +365,35 @@ Result<Response> executeUnaryRequest(
     return result;
 }
 
+template <typename Response, typename Request, typename Call>
+Result<Response> executeWriteUnaryRequest(
+    const Client & client,
+    const ClientSettings & settings,
+    const Request & request,
+    const std::string & request_params,
+    Call && call)
+{
+    Result<Response> result;
+    const UInt64 attempts = maxAttempts(settings);
+
+    for (UInt64 attempt = 1; attempt <= attempts; ++attempt)
+    {
+        auto context = client.makeContext(result.status, request_params);
+        if (!result.ok())
+            return result;
+
+        settings.request_throttler.throttleHTTPPut();
+        result.status = fromGrpcStatus(call(*context, request, result.response));
+        if (result.ok())
+            return result;
+
+        if (!shouldRetry(result.status, attempt, attempts))
+            return result;
+    }
+
+    return result;
+}
+
 template <typename Stream>
 class AccountingReader final : public grpc::ClientReaderInterface<Stream>
 {
@@ -455,6 +484,22 @@ public:
         return stub->ListObjects(&context, request, &response);
     }
 
+    grpc::Status composeObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::ComposeObjectRequest & request,
+        google::storage::v2::Object & response) override
+    {
+        return stub->ComposeObject(&context, request, &response);
+    }
+
+    grpc::Status rewriteObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::RewriteObjectRequest & request,
+        google::storage::v2::RewriteResponse & response) override
+    {
+        return stub->RewriteObject(&context, request, &response);
+    }
+
     grpc::Status deleteObject(
         grpc::ClientContext & context,
         const google::storage::v2::DeleteObjectRequest & request,
@@ -495,6 +540,24 @@ std::shared_ptr<google::cloud::Credentials> makeCredentials(const ClientSettings
 std::string bucketRoutingParameter(const std::string & bucket)
 {
     return "bucket=" + google::cloud::internal::UrlEncode(bucket);
+}
+
+std::string rewriteObjectRoutingParameter(const google::storage::v2::RewriteObjectRequest & request)
+{
+    std::vector<std::string> parameters;
+    if (!request.source_bucket().empty())
+        parameters.push_back("source_bucket=" + google::cloud::internal::UrlEncode(request.source_bucket()));
+    if (!request.destination_bucket().empty())
+        parameters.push_back("bucket=" + google::cloud::internal::UrlEncode(request.destination_bucket()));
+
+    std::string result;
+    for (const auto & parameter : parameters)
+    {
+        if (!result.empty())
+            result += "&";
+        result += parameter;
+    }
+    return result;
 }
 
 grpc::Status nextStatus(std::vector<grpc::Status> & statuses, const grpc::Status & fallback)
@@ -571,6 +634,28 @@ Status Client::deleteObject(const google::storage::v2::DeleteObjectRequest & req
         [this](grpc::ClientContext & context, const auto & request_, auto & response_)
         { return stub->deleteObject(context, request_, response_); });
     return result.status;
+}
+
+Result<google::storage::v2::Object> Client::composeObject(const google::storage::v2::ComposeObjectRequest & request) const
+{
+    return executeWriteUnaryRequest<google::storage::v2::Object>(
+        *this,
+        settings,
+        request,
+        bucketRoutingParameter(request.destination().bucket()),
+        [this](grpc::ClientContext & context, const auto & request_, auto & response)
+        { return stub->composeObject(context, request_, response); });
+}
+
+Result<google::storage::v2::RewriteResponse> Client::rewriteObject(const google::storage::v2::RewriteObjectRequest & request) const
+{
+    return executeWriteUnaryRequest<google::storage::v2::RewriteResponse>(
+        *this,
+        settings,
+        request,
+        rewriteObjectRoutingParameter(request),
+        [this](grpc::ClientContext & context, const auto & request_, auto & response)
+        { return stub->rewriteObject(context, request_, response); });
 }
 
 StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>>
@@ -848,6 +933,82 @@ FakeStub::deleteObject(grpc::ClientContext & context, const google::storage::v2:
         objects.erase(it);
     }
 
+    return grpc::Status::OK;
+}
+
+grpc::Status FakeStub::composeObject(
+    grpc::ClientContext & context, const google::storage::v2::ComposeObjectRequest & request, google::storage::v2::Object & response)
+{
+    last_deadline = context.deadline();
+    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
+    compose_object_requests.push_back(request);
+
+    if (!compose_object_status.ok())
+        return compose_object_status;
+
+    if (use_object_map)
+    {
+        std::string data;
+        for (const auto & source : request.source_objects())
+        {
+            auto it = objects.find(fakeObjectKey(request.destination().bucket(), source.name()));
+            if (it == objects.end())
+                return grpc::Status(grpc::StatusCode::NOT_FOUND, "fake compose source object not found");
+            data += it->second.data;
+        }
+
+        FakeObject object;
+        object.data = std::move(data);
+        object.metadata = request.destination();
+        object.metadata.set_size(static_cast<int64_t>(object.data.size()));
+        objects[fakeObjectKey(object.metadata.bucket(), object.metadata.name())] = object;
+        response = object.metadata;
+        return grpc::Status::OK;
+    }
+
+    response = compose_object_response;
+    return grpc::Status::OK;
+}
+
+grpc::Status FakeStub::rewriteObject(
+    grpc::ClientContext & context, const google::storage::v2::RewriteObjectRequest & request, google::storage::v2::RewriteResponse & response)
+{
+    last_deadline = context.deadline();
+    last_metadata = grpc::testing::ClientContextTestPeer(&context).GetSendInitialMetadata();
+    rewrite_object_requests.push_back(request);
+
+    if (!rewrite_object_status.ok())
+        return rewrite_object_status;
+
+    if (!rewrite_object_responses.empty())
+    {
+        response = rewrite_object_responses.front();
+        rewrite_object_responses.erase(rewrite_object_responses.begin());
+        return grpc::Status::OK;
+    }
+
+    if (use_object_map)
+    {
+        auto it = objects.find(fakeObjectKey(request.source_bucket(), request.source_object()));
+        if (it == objects.end())
+            return grpc::Status(grpc::StatusCode::NOT_FOUND, "fake rewrite source object not found");
+
+        FakeObject object;
+        object.data = it->second.data;
+        object.metadata = request.has_destination() ? request.destination() : it->second.metadata;
+        object.metadata.set_bucket(request.destination_bucket());
+        object.metadata.set_name(request.destination_name());
+        object.metadata.set_size(static_cast<int64_t>(object.data.size()));
+        objects[fakeObjectKey(object.metadata.bucket(), object.metadata.name())] = object;
+
+        response.set_done(true);
+        response.set_total_bytes_rewritten(static_cast<int64_t>(object.data.size()));
+        response.set_object_size(static_cast<int64_t>(object.data.size()));
+        *response.mutable_resource() = object.metadata;
+        return grpc::Status::OK;
+    }
+
+    response = rewrite_object_response;
     return grpc::Status::OK;
 }
 

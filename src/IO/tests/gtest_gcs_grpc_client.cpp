@@ -166,6 +166,21 @@ private:
     google::cloud::Status failure;
 };
 
+GCS::FakeStub::FakeObject fakeObject(const std::string & bucket, const std::string & name, const std::string & data)
+{
+    GCS::FakeStub::FakeObject object;
+    object.data = data;
+    object.metadata.set_bucket(bucket);
+    object.metadata.set_name(name);
+    object.metadata.set_size(static_cast<int64_t>(data.size()));
+    return object;
+}
+
+std::string fakeObjectKey(const std::string & bucket, const std::string & name)
+{
+    return bucket + "\n" + name;
+}
+
 }
 
 TEST(GCSGrpcClientFoundation, GrpcStatusIncludesDetailsAndNumericCode)
@@ -191,6 +206,49 @@ TEST(GCSGrpcClientFoundation, GrpcStatusMapping)
         GCS::StatusCode::ResourceExhausted,
         GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "resource exhausted")).code);
     EXPECT_EQ(GCS::StatusCode::Unsupported, GCS::fromGrpcStatus(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "unsupported")).code);
+}
+
+TEST(GCSGrpcClientFoundation, GeneratedGrpcApiSupportsPlannedPrimitive)
+{
+    google::storage::v2::ComposeObjectRequest compose_request;
+    compose_request.mutable_destination()->set_bucket("projects/_/buckets/test");
+    compose_request.mutable_destination()->set_name("composed");
+    compose_request.add_source_objects()->set_name("part");
+
+    google::storage::v2::RewriteObjectRequest rewrite_request;
+    rewrite_request.set_source_bucket("projects/_/buckets/test");
+    rewrite_request.set_source_object("source");
+    rewrite_request.set_destination_bucket("projects/_/buckets/test");
+    rewrite_request.set_destination_name("dest");
+
+    google::storage::v2::StartResumableWriteRequest resumable_request;
+    resumable_request.mutable_write_object_spec()->mutable_resource()->set_bucket("projects/_/buckets/test");
+    resumable_request.mutable_write_object_spec()->mutable_resource()->set_name("dest");
+
+    google::storage::v2::BidiWriteObjectRequest bidi_request;
+    bidi_request.mutable_write_object_spec()->mutable_resource()->set_bucket("projects/_/buckets/test");
+    bidi_request.mutable_write_object_spec()->mutable_resource()->set_name("dest");
+    using StubInterface = google::storage::v2::Storage::StubInterface;
+    grpc::Status (StubInterface::*compose_method)(
+        grpc::ClientContext *, const google::storage::v2::ComposeObjectRequest &, google::storage::v2::Object *)
+        = &StubInterface::ComposeObject;
+    grpc::Status (StubInterface::*rewrite_method)(
+        grpc::ClientContext *, const google::storage::v2::RewriteObjectRequest &, google::storage::v2::RewriteResponse *)
+        = &StubInterface::RewriteObject;
+    grpc::Status (StubInterface::*start_resumable_method)(
+        grpc::ClientContext *, const google::storage::v2::StartResumableWriteRequest &, google::storage::v2::StartResumableWriteResponse *)
+        = &StubInterface::StartResumableWrite;
+    std::unique_ptr<grpc::ClientReaderWriterInterface<google::storage::v2::BidiWriteObjectRequest, google::storage::v2::BidiWriteObjectResponse>>
+        (StubInterface::*bidi_method)(grpc::ClientContext *) = &StubInterface::BidiWriteObject;
+
+    EXPECT_EQ("projects/_/buckets/test", compose_request.destination().bucket());
+    EXPECT_EQ("projects/_/buckets/test", rewrite_request.destination_bucket());
+    EXPECT_EQ("projects/_/buckets/test", resumable_request.write_object_spec().resource().bucket());
+    EXPECT_EQ("projects/_/buckets/test", bidi_request.write_object_spec().resource().bucket());
+    EXPECT_TRUE(compose_method != nullptr);
+    EXPECT_TRUE(rewrite_method != nullptr);
+    EXPECT_TRUE(start_resumable_method != nullptr);
+    EXPECT_TRUE(bidi_method != nullptr);
 }
 
 TEST(GCSGrpcClientFoundation, FakeUnaryRequests)
@@ -243,6 +301,25 @@ TEST(GCSGrpcClientFoundation, RoutingMetadataForUnaryRequests)
     EXPECT_TRUE(client.deleteObject(delete_request).ok());
     expectSingleMetadata(fake_stub->last_metadata, "x-goog-request-params", "bucket=projects%2F_%2Fbuckets%2Ffoo");
     expectSingleMetadata(fake_stub->last_metadata, "x-goog-user-project", "billing-project");
+    google::storage::v2::ComposeObjectRequest compose_request;
+    compose_request.mutable_destination()->set_bucket("projects/_/buckets/foo");
+    compose_request.mutable_destination()->set_name("joined");
+    compose_request.add_source_objects()->set_name("part");
+    ASSERT_TRUE(client.composeObject(compose_request).ok());
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-request-params", "bucket=projects%2F_%2Fbuckets%2Ffoo");
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-user-project", "billing-project");
+
+    google::storage::v2::RewriteObjectRequest rewrite_request;
+    rewrite_request.set_source_bucket("projects/_/buckets/source");
+    rewrite_request.set_source_object("src");
+    rewrite_request.set_destination_bucket("projects/_/buckets/foo");
+    rewrite_request.set_destination_name("dst");
+    ASSERT_TRUE(client.rewriteObject(rewrite_request).ok());
+    expectSingleMetadata(
+        fake_stub->last_metadata,
+        "x-goog-request-params",
+        "source_bucket=projects%2F_%2Fbuckets%2Fsource&bucket=projects%2F_%2Fbuckets%2Ffoo");
+    expectSingleMetadata(fake_stub->last_metadata, "x-goog-user-project", "billing-project");
 }
 
 TEST(GCSGrpcClientFoundation, RoutingMetadataForReadStream)
@@ -293,6 +370,19 @@ TEST(GCSGrpcClientFoundation, AuthContextFailurePropagation)
     EXPECT_EQ(GCS::StatusCode::PermissionDenied, read_result.status.code);
     EXPECT_EQ(nullptr, read_result.stream.get());
     EXPECT_TRUE(fake_stub->read_object_requests.empty());
+    google::storage::v2::ComposeObjectRequest compose_request;
+    compose_request.mutable_destination()->set_bucket("projects/_/buckets/foo");
+    auto compose_result = client.composeObject(compose_request);
+    EXPECT_FALSE(compose_result.ok());
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, compose_result.status.code);
+    EXPECT_TRUE(fake_stub->compose_object_requests.empty());
+
+    google::storage::v2::RewriteObjectRequest rewrite_request;
+    rewrite_request.set_destination_bucket("projects/_/buckets/foo");
+    auto rewrite_result = client.rewriteObject(rewrite_request);
+    EXPECT_FALSE(rewrite_result.ok());
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, rewrite_result.status.code);
+    EXPECT_TRUE(fake_stub->rewrite_object_requests.empty());
 }
 
 TEST(GCSGrpcClientFoundation, FakeStatusFailure)
@@ -345,6 +435,113 @@ TEST(GCSGrpcClientFoundation, FakeStreamingRequests)
     ASSERT_TRUE(write_stream.stream->Write(write_request));
     EXPECT_TRUE(write_stream.stream->WritesDone());
     EXPECT_TRUE(write_stream.stream->Finish().ok());
+}
+
+TEST(GCSGrpcClientFoundation, FakeComposeObjectMapAndFailure)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->use_object_map = true;
+    fake_stub->objects[fakeObjectKey("projects/_/buckets/test", "a")] = fakeObject("projects/_/buckets/test", "a", "abc");
+    fake_stub->objects[fakeObjectKey("projects/_/buckets/test", "b")] = fakeObject("projects/_/buckets/test", "b", "def");
+
+    GCS::Client client({}, fake_stub);
+
+    google::storage::v2::ComposeObjectRequest request;
+    request.mutable_destination()->set_bucket("projects/_/buckets/test");
+    request.mutable_destination()->set_name("joined");
+    request.add_source_objects()->set_name("a");
+    request.add_source_objects()->set_name("b");
+
+    auto result = client.composeObject(request);
+    ASSERT_TRUE(result.ok()) << result.status.message;
+    EXPECT_EQ("joined", result.response.name());
+    EXPECT_EQ(6, result.response.size());
+    EXPECT_EQ("abcdef", fake_stub->objects[fakeObjectKey("projects/_/buckets/test", "joined")].data);
+    ASSERT_EQ(1, fake_stub->compose_object_requests.size());
+    EXPECT_EQ("a", fake_stub->compose_object_requests.front().source_objects(0).name());
+
+    google::storage::v2::ComposeObjectRequest missing_source_request;
+    missing_source_request.mutable_destination()->set_bucket("projects/_/buckets/test");
+    missing_source_request.mutable_destination()->set_name("missing-joined");
+    missing_source_request.add_source_objects()->set_name("missing");
+    auto missing_result = client.composeObject(missing_source_request);
+    EXPECT_FALSE(missing_result.ok());
+    EXPECT_EQ(GCS::StatusCode::NotFound, missing_result.status.code);
+}
+
+TEST(GCSGrpcClientFoundation, FakeComposeStatusFailure)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->compose_object_status = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "compose denied");
+
+    GCS::Client client({}, fake_stub);
+
+    google::storage::v2::ComposeObjectRequest request;
+    request.mutable_destination()->set_bucket("projects/_/buckets/test");
+    request.mutable_destination()->set_name("joined");
+
+    auto result = client.composeObject(request);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(GCS::StatusCode::InvalidArgument, result.status.code);
+    ASSERT_EQ(1, fake_stub->compose_object_requests.size());
+}
+
+TEST(GCSGrpcClientFoundation, FakeRewriteObjectMapAndTokens)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->use_object_map = true;
+    fake_stub->objects[fakeObjectKey("projects/_/buckets/source", "src")] = fakeObject("projects/_/buckets/source", "src", "payload");
+
+    GCS::Client client({}, fake_stub);
+
+    google::storage::v2::RewriteObjectRequest request;
+    request.set_source_bucket("projects/_/buckets/source");
+    request.set_source_object("src");
+    request.set_destination_bucket("projects/_/buckets/dest");
+    request.set_destination_name("dst");
+
+    auto result = client.rewriteObject(request);
+    ASSERT_TRUE(result.ok()) << result.status.message;
+    EXPECT_TRUE(result.response.done());
+    EXPECT_EQ("dst", result.response.resource().name());
+    EXPECT_EQ("payload", fake_stub->objects[fakeObjectKey("projects/_/buckets/dest", "dst")].data);
+
+    google::storage::v2::RewriteResponse first_response;
+    first_response.set_done(false);
+    first_response.set_rewrite_token("continue-token");
+    google::storage::v2::RewriteResponse second_response;
+    second_response.set_done(true);
+    second_response.mutable_resource()->set_name("dst");
+    fake_stub->rewrite_object_responses = {first_response, second_response};
+
+    auto first = client.rewriteObject(request);
+    ASSERT_TRUE(first.ok()) << first.status.message;
+    EXPECT_FALSE(first.response.done());
+    EXPECT_EQ("continue-token", first.response.rewrite_token());
+
+    google::storage::v2::RewriteObjectRequest continuation = request;
+    continuation.set_rewrite_token(first.response.rewrite_token());
+    auto second = client.rewriteObject(continuation);
+    ASSERT_TRUE(second.ok()) << second.status.message;
+    EXPECT_TRUE(second.response.done());
+    ASSERT_GE(fake_stub->rewrite_object_requests.size(), 3);
+    EXPECT_EQ("continue-token", fake_stub->rewrite_object_requests.back().rewrite_token());
+}
+
+TEST(GCSGrpcClientFoundation, FakeRewriteStatusFailure)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    fake_stub->rewrite_object_status = grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "rewrite denied");
+
+    GCS::Client client({}, fake_stub);
+
+    google::storage::v2::RewriteObjectRequest request;
+    request.set_destination_bucket("projects/_/buckets/test");
+
+    auto result = client.rewriteObject(request);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(GCS::StatusCode::PermissionDenied, result.status.code);
+    ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
 }
 
 TEST(GCSGrpcClientFoundation, RetryableUnaryRequestRetriesAndAccounts)

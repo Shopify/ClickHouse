@@ -82,6 +82,18 @@ public:
         google::storage::v2::ListObjectsResponse & response)
         = 0;
 
+    virtual grpc::Status composeObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::ComposeObjectRequest & request,
+        google::storage::v2::Object & response)
+        = 0;
+
+    virtual grpc::Status rewriteObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::RewriteObjectRequest & request,
+        google::storage::v2::RewriteResponse & response)
+        = 0;
+
     virtual grpc::Status deleteObject(
         grpc::ClientContext & context, const google::storage::v2::DeleteObjectRequest & request, google::protobuf::Empty & response)
         = 0;
@@ -104,6 +116,8 @@ public:
     Result<google::storage::v2::Object> getObject(const google::storage::v2::GetObjectRequest & request) const;
     Result<google::storage::v2::ListObjectsResponse> listObjects(const google::storage::v2::ListObjectsRequest & request) const;
     Status deleteObject(const google::storage::v2::DeleteObjectRequest & request) const;
+    Result<google::storage::v2::Object> composeObject(const google::storage::v2::ComposeObjectRequest & request) const;
+    Result<google::storage::v2::RewriteResponse> rewriteObject(const google::storage::v2::RewriteObjectRequest & request) const;
 
     StreamResult<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>>
     readObject(const google::storage::v2::ReadObjectRequest & request) const;
@@ -189,6 +203,11 @@ public:
     std::vector<grpc::Status> list_objects_statuses;
     google::storage::v2::ListObjectsResponse list_objects_response;
     grpc::Status delete_object_status;
+    grpc::Status compose_object_status;
+    google::storage::v2::Object compose_object_response;
+    grpc::Status rewrite_object_status;
+    google::storage::v2::RewriteResponse rewrite_object_response;
+    std::vector<google::storage::v2::RewriteResponse> rewrite_object_responses;
     std::vector<grpc::Status> delete_object_statuses;
     std::vector<google::storage::v2::ReadObjectResponse> read_object_responses;
     grpc::Status read_object_finish_status;
@@ -206,6 +225,8 @@ public:
     std::vector<google::storage::v2::GetObjectRequest> get_object_requests;
     std::vector<google::storage::v2::ListObjectsRequest> list_objects_requests;
     std::vector<google::storage::v2::DeleteObjectRequest> delete_object_requests;
+    std::vector<google::storage::v2::ComposeObjectRequest> compose_object_requests;
+    std::vector<google::storage::v2::RewriteObjectRequest> rewrite_object_requests;
     std::vector<google::storage::v2::ReadObjectRequest> read_object_requests;
     std::vector<google::storage::v2::WriteObjectRequest> write_object_requests;
 
@@ -218,6 +239,16 @@ public:
         grpc::ClientContext & context,
         const google::storage::v2::ListObjectsRequest & request,
         google::storage::v2::ListObjectsResponse & response) override;
+
+    grpc::Status composeObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::ComposeObjectRequest & request,
+        google::storage::v2::Object & response) override;
+
+    grpc::Status rewriteObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::RewriteObjectRequest & request,
+        google::storage::v2::RewriteResponse & response) override;
 
     grpc::Status deleteObject(
         grpc::ClientContext & context,
