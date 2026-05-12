@@ -108,12 +108,7 @@ ObjectMetadata metadataFromProto(const google::storage::v2::Object & object, boo
     return metadata;
 }
 
-std::string cordToString(const absl::Cord & cord)
-{
-    std::string result;
-    absl::CopyCordToString(cord, &result);
-    return result;
-}
+
 
 String statusLogMessage(const GCS::Status & status)
 {
@@ -133,15 +128,33 @@ public:
         String object_name_,
         size_t buf_size,
         std::optional<size_t> file_size_,
+        std::optional<size_t> read_hint_,
+        bool remote_fs_prefetch_,
+        size_t prefetch_buffer_size_,
         ThrottlerPtr remote_throttler_,
         BlobStorageLogWriterPtr blob_storage_log_)
         : ReadBufferFromFileBase(buf_size, nullptr, 0, file_size_)
         , client(std::move(client_))
         , bucket(std::move(bucket_))
         , object_name(std::move(object_name_))
+        , read_hint(read_hint_)
+        , remote_fs_prefetch(remote_fs_prefetch_)
+        , prefetch_buffer_size(prefetch_buffer_size_)
         , remote_throttler(std::move(remote_throttler_))
         , blob_storage_log(std::move(blob_storage_log_))
     {
+    }
+
+    ~GCSReadBuffer() override
+    {
+        try
+        {
+            finishSequentialStream(/* require_expected_bytes */ false);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+        }
     }
 
     String getFileName() const override { return object_name; }
@@ -163,6 +176,7 @@ public:
                 ErrorCodes::BAD_ARGUMENTS, "Native GCS read buffer seek offset {} is past object size {}", new_position, *file_size);
 
         read_offset = static_cast<size_t>(new_position);
+        resetSequentialStream();
         set(internal_buffer.begin(), internal_buffer.size());
         return new_position;
     }
@@ -174,56 +188,271 @@ public:
 
     size_t readBigAt(char * to, size_t n, size_t offset, const std::function<bool(size_t)> & progress_callback) const override
     {
-        auto data = fetchRange(offset, n);
-        memcpy(to, data.data(), data.size());
-        if (progress_callback)
-            progress_callback(data.size());
-        return data.size();
+        if (file_size && offset >= *file_size)
+            return 0;
+
+        size_t bytes_to_read = n;
+        if (file_size)
+            bytes_to_read = std::min(bytes_to_read, *file_size - offset);
+
+        return fetchRangeInto(to, offset, bytes_to_read, progress_callback);
     }
 
     std::optional<size_t> getRemoteFileSize() const override { return file_size; }
     size_t getFileOffsetOfBufferEnd() const override { return read_offset; }
 
 private:
+    using ReadObjectStream = grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>;
+
+    struct SequentialStream
+    {
+        GCS::StreamResult<ReadObjectStream> result;
+        std::optional<size_t> limit;
+        size_t bytes_read_from_stream = 0;
+    };
+
     size_t available() const { return static_cast<size_t>(working_buffer.end() - pos); }
 
     bool nextImpl() override
     {
-        if (file_size && read_offset >= *file_size)
-            return false;
+        Stopwatch watch;
+        Int32 error_code = 0;
+        String error_message;
+        size_t bytes_read = 0;
 
-        size_t bytes_to_read = internal_buffer.size();
-        if (file_size)
-            bytes_to_read = std::min(bytes_to_read, *file_size - read_offset);
-        if (bytes_to_read == 0)
-            return false;
+        try
+        {
+            CurrentThread::ReadThrottlingScope read_throttling_scope(remote_throttler);
 
-        auto data = fetchRange(read_offset, bytes_to_read);
-        if (data.empty())
-            return false;
+            if (file_size && read_offset >= *file_size)
+            {
+                if (sequential_stream)
+                    finishSequentialStream();
+                return false;
+            }
+            bytes_read = copyPending(internal_buffer.begin(), internal_buffer.size());
+            while (bytes_read < internal_buffer.size() && !sequential_eof)
+            {
+                ensureSequentialStream(read_offset + bytes_read);
+                if (sequential_eof)
+                    break;
 
-        memcpy(internal_buffer.begin(), data.data(), data.size());
-        working_buffer = Buffer(internal_buffer.begin(), internal_buffer.begin() + data.size());
-        pos = working_buffer.begin();
-        read_offset += data.size();
-        return true;
+                google::storage::v2::ReadObjectResponse response;
+                if (!sequential_stream->result.stream->Read(&response))
+                {
+                    finishSequentialStream();
+                    continue;
+                }
+
+                if (!response.has_checksummed_data())
+                    continue;
+
+                const auto & content = response.checksummed_data().content();
+                if (content.empty())
+                    continue;
+
+                sequential_stream->bytes_read_from_stream += content.size();
+                bytes_read += copyCordToBuffer(content, internal_buffer.begin() + bytes_read, internal_buffer.size() - bytes_read);
+            }
+
+            if (bytes_read == 0)
+                return false;
+
+            if (remote_throttler)
+                remote_throttler->throttle(bytes_read);
+
+            working_buffer = Buffer(internal_buffer.begin(), internal_buffer.begin() + bytes_read);
+            pos = working_buffer.begin();
+            read_offset += bytes_read;
+
+            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSBytes, bytes_read);
+            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSMicroseconds, watch.elapsedMicroseconds());
+            addBlobLogEvent(bytes_read, watch.elapsedMicroseconds(), 0, {});
+            return true;
+        }
+        catch (...)
+        {
+            if (!error_code)
+            {
+                error_code = getCurrentExceptionCode();
+                error_message = getCurrentExceptionMessage(false);
+                ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
+                addBlobLogEvent(bytes_read, watch.elapsedMicroseconds(), error_code, error_message);
+            }
+            throw;
+        }
     }
 
-    String fetchRange(size_t offset, size_t limit) const
+    std::optional<size_t> sequentialReadLimit(size_t offset) const
+    {
+        if (file_size)
+            return std::min(*file_size - offset, sequentialWindowSizeForKnownFile());
+
+        size_t limit = 0;
+        if (read_hint)
+            limit = std::max(limit, *read_hint);
+        if (remote_fs_prefetch)
+            limit = std::max(limit, prefetch_buffer_size);
+
+        if (limit > internal_buffer.size())
+            return limit;
+        return {};
+    }
+
+    size_t sequentialWindowSizeForKnownFile() const
+    {
+        size_t limit = std::max(internal_buffer.size(), internal_buffer.size() * 16);
+        limit = std::max(limit, prefetch_buffer_size);
+        if (read_hint)
+            limit = std::max(limit, *read_hint);
+        return limit;
+    }
+
+    void ensureSequentialStream(size_t offset)
+    {
+        if (sequential_stream || sequential_eof)
+            return;
+
+        if (file_size && offset >= *file_size)
+        {
+            sequential_eof = true;
+            return;
+        }
+
+        google::storage::v2::ReadObjectRequest request;
+        request.set_bucket(bucketResourceName(bucket));
+        request.set_object(object_name);
+        request.set_read_offset(static_cast<int64_t>(offset));
+
+        auto limit = sequentialReadLimit(offset);
+        if (limit && *limit > 0)
+            request.set_read_limit(static_cast<int64_t>(*limit));
+
+        Stopwatch init_watch;
+        sequential_stream.emplace();
+        sequential_stream->limit = limit;
+        sequential_stream->result = client->readObject(request);
+        ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSInitMicroseconds, init_watch.elapsedMicroseconds());
+
+        if (!sequential_stream->result.ok())
+        {
+            auto status = sequential_stream->result.status;
+            sequential_stream.reset();
+            GCS::throwIfError(status, "ReadObject");
+        }
+    }
+
+    void finishSequentialStream(bool require_expected_bytes = true)
+    {
+        if (!sequential_stream)
+            return;
+
+        const auto finish_status = GCS::fromGrpcStatus(sequential_stream->result.stream->Finish());
+        const auto bytes_read_from_stream = sequential_stream->bytes_read_from_stream;
+        const auto limit = sequential_stream->limit;
+        sequential_stream.reset();
+
+        if (!finish_status.ok())
+            GCS::throwIfError(finish_status, "ReadObject");
+
+        if (require_expected_bytes && file_size && limit && bytes_read_from_stream < *limit)
+            throw Exception(
+                ErrorCodes::S3_ERROR,
+                "Native GCS ReadObject for '{}' ended after {} bytes before requested {} bytes",
+                object_name,
+                bytes_read_from_stream,
+                *limit);
+
+        if (file_size)
+        {
+            sequential_eof = read_offset >= *file_size;
+            return;
+        }
+        if (!limit || bytes_read_from_stream < *limit)
+            sequential_eof = true;
+    }
+
+    size_t copyPending(char * to, size_t limit)
+    {
+        if (pending_data.empty() || limit == 0)
+            return 0;
+
+        const size_t pending_size = pending_data.size() - pending_data_offset;
+        const size_t bytes_to_copy = std::min(limit, pending_size);
+        memcpy(to, pending_data.data() + pending_data_offset, bytes_to_copy);
+        pending_data_offset += bytes_to_copy;
+
+        if (pending_data_offset == pending_data.size())
+        {
+            pending_data.clear();
+            pending_data_offset = 0;
+        }
+
+        return bytes_to_copy;
+    }
+
+    size_t copyCordToBuffer(const absl::Cord & cord, char * to, size_t limit)
+    {
+        size_t copied = 0;
+        for (absl::string_view chunk : cord.Chunks())
+        {
+            if (copied == limit)
+            {
+                pending_data.append(chunk.data(), chunk.size());
+                continue;
+            }
+
+            const size_t bytes_to_copy = std::min<size_t>(chunk.size(), limit - copied);
+            memcpy(to + copied, chunk.data(), bytes_to_copy);
+            copied += bytes_to_copy;
+
+            if (bytes_to_copy < chunk.size())
+                pending_data.append(chunk.data() + bytes_to_copy, chunk.size() - bytes_to_copy);
+        }
+        return copied;
+    }
+
+    void resetSequentialStream()
+    {
+        try
+        {
+            finishSequentialStream(/* require_expected_bytes */ false);
+        }
+        catch (...)
+        {
+            const auto error_code = getCurrentExceptionCode();
+            const auto error_message = getCurrentExceptionMessage(false);
+            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
+            addBlobLogEvent(0, 0, error_code, error_message);
+            throw;
+        }
+        resetSequentialState();
+    }
+
+    void resetSequentialState()
+    {
+        pending_data.clear();
+        pending_data_offset = 0;
+        sequential_eof = false;
+    }
+
+    void addBlobLogEvent(size_t data_size, size_t elapsed_microseconds, Int32 code, const String & message) const
+    {
+        if (blob_storage_log)
+            blob_storage_log->addEvent(
+                BlobStorageLogElement::EventType::Read, bucket, object_name, {}, data_size, elapsed_microseconds, code, message);
+    }
+
+    size_t fetchRangeInto(
+        char * to, size_t offset, size_t limit, const std::function<bool(size_t)> & progress_callback) const
     {
         if (limit == 0)
-            return {};
+            return 0;
 
         Stopwatch watch;
         Int32 error_code = 0;
         String error_message;
-
-        const auto add_blob_log_event = [&](size_t data_size, Int32 code, const String & message)
-        {
-            if (blob_storage_log)
-                blob_storage_log->addEvent(
-                    BlobStorageLogElement::EventType::Read, bucket, object_name, {}, data_size, watch.elapsedMicroseconds(), code, message);
-        };
+        size_t bytes_read = 0;
 
         try
         {
@@ -238,40 +467,64 @@ private:
             Stopwatch init_watch;
             auto stream_result = client->readObject(request);
             ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSInitMicroseconds, init_watch.elapsedMicroseconds());
-            if (!stream_result.status.ok())
+            if (!stream_result.ok())
             {
                 error_code = GCS::errorCodeForStatus(stream_result.status.code);
                 error_message = statusLogMessage(stream_result.status);
                 ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
-                add_blob_log_event(limit, error_code, error_message);
+                addBlobLogEvent(bytes_read, watch.elapsedMicroseconds(), error_code, error_message);
                 GCS::throwIfError(stream_result.status, "ReadObject");
             }
 
-            String data;
+            bool cancelled = false;
             google::storage::v2::ReadObjectResponse response;
-            while (stream_result.stream->Read(&response))
+            while (bytes_read < limit && !cancelled && stream_result.stream->Read(&response))
             {
-                if (response.has_checksummed_data())
-                    data += cordToString(response.checksummed_data().content());
+                if (!response.has_checksummed_data())
+                    continue;
+
+                for (absl::string_view chunk : response.checksummed_data().content().Chunks())
+                {
+                    size_t chunk_offset = 0;
+                    while (chunk_offset < chunk.size() && bytes_read < limit)
+                    {
+                        const size_t bytes_to_copy = std::min<size_t>(
+                            std::min(chunk.size() - chunk_offset, limit - bytes_read), internal_buffer.size());
+                        memcpy(to + bytes_read, chunk.data() + chunk_offset, bytes_to_copy);
+                        chunk_offset += bytes_to_copy;
+                        bytes_read += bytes_to_copy;
+
+                        if (bytes_to_copy && progress_callback && progress_callback(bytes_read))
+                        {
+                            cancelled = true;
+                            break;
+                        }
+                    }
+                    if (cancelled)
+                        break;
+                }
             }
 
+            if (cancelled && stream_result.context)
+                stream_result.context->TryCancel();
+
             auto finish_status = GCS::fromGrpcStatus(stream_result.stream->Finish());
-            if (!finish_status.ok())
+            if (!finish_status.ok() && !cancelled)
             {
                 error_code = GCS::errorCodeForStatus(finish_status.code);
                 error_message = statusLogMessage(finish_status);
                 ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
-                add_blob_log_event(limit, error_code, error_message);
+                addBlobLogEvent(bytes_read, watch.elapsedMicroseconds(), error_code, error_message);
                 GCS::throwIfError(finish_status, "ReadObject");
             }
 
-            if (remote_throttler && !data.empty())
-                remote_throttler->throttle(data.size());
+            if (remote_throttler && bytes_read)
+                remote_throttler->throttle(bytes_read);
 
-            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSBytes, data.size());
+            ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSBytes, bytes_read);
             ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSMicroseconds, watch.elapsedMicroseconds());
-            add_blob_log_event(data.size(), 0, {});
-            return data;
+            addBlobLogEvent(bytes_read, watch.elapsedMicroseconds(), 0, {});
+            return bytes_read;
         }
         catch (...)
         {
@@ -280,7 +533,7 @@ private:
                 error_code = getCurrentExceptionCode();
                 error_message = getCurrentExceptionMessage(false);
                 ProfileEvents::increment(ProfileEvents::ReadBufferFromGCSRequestsErrors);
-                add_blob_log_event(limit, error_code, error_message);
+                addBlobLogEvent(bytes_read, watch.elapsedMicroseconds(), error_code, error_message);
             }
             throw;
         }
@@ -289,9 +542,16 @@ private:
     std::shared_ptr<GCS::Client> client;
     String bucket;
     String object_name;
+    std::optional<size_t> read_hint;
+    bool remote_fs_prefetch;
+    size_t prefetch_buffer_size;
     ThrottlerPtr remote_throttler;
     BlobStorageLogWriterPtr blob_storage_log;
+    std::optional<SequentialStream> sequential_stream;
+    String pending_data;
+    size_t pending_data_offset = 0;
     size_t read_offset = 0;
+    bool sequential_eof = false;
 };
 
 class GCSWriteBuffer final : public WriteBufferFromFileBase
@@ -521,7 +781,7 @@ bool GCSObjectStorage::exists(const StoredObject & object) const
 }
 
 std::unique_ptr<ReadBufferFromFileBase>
-GCSObjectStorage::readObject(const StoredObject & object, const ReadSettings & read_settings, std::optional<size_t>) const
+GCSObjectStorage::readObject(const StoredObject & object, const ReadSettings & read_settings, std::optional<size_t> read_hint) const
 {
 #if USE_GOOGLE_CLOUD
     std::optional<size_t> file_size;
@@ -542,6 +802,9 @@ GCSObjectStorage::readObject(const StoredObject & object, const ReadSettings & r
         objectName(object.remote_path),
         read_settings.remote_fs_buffer_size,
         file_size,
+        read_hint,
+        read_settings.remote_fs_prefetch,
+        read_settings.prefetch_buffer_size,
         read_settings.remote_throttler,
         std::move(blob_storage_log));
 #else
@@ -867,4 +1130,5 @@ ObjectStoragePtr createGCSObjectStorage(
         "Native GCS gRPC support is not available because ClickHouse was built without Google Cloud C++ gRPC support");
 #endif
 }
+
 }

@@ -142,6 +142,33 @@ std::shared_ptr<Throttler> blockingThrottler(ProfileEvents::Event amount, Profil
     return std::make_shared<Throttler>(1000, 0, nullptr, amount, sleep);
 }
 
+class FailingAuth final : public google::cloud::internal::GrpcAuthenticationStrategy
+{
+public:
+    explicit FailingAuth(google::cloud::Status failure_)
+        : failure(std::move(failure_))
+    {
+    }
+
+    std::shared_ptr<grpc::Channel> CreateChannel(std::string const &, grpc::ChannelArguments const &) override
+    {
+        return grpc::CreateChannel("localhost", grpc::InsecureChannelCredentials());
+    }
+
+    bool RequiresConfigureContext() const override { return true; }
+
+    google::cloud::Status ConfigureContext(grpc::ClientContext &) override { return failure; }
+
+    google::cloud::future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>>
+    AsyncConfigureContext(std::shared_ptr<grpc::ClientContext>) override
+    {
+        return google::cloud::make_ready_future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>>(failure);
+    }
+
+private:
+    google::cloud::Status failure;
+};
+
 class CapturedBlobStorageLog
 {
 public:
@@ -186,7 +213,8 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
     const std::shared_ptr<GCS::FakeStub> & fake_stub,
     bool read_only = false,
     GCS::ClientSettings client_settings = {},
-    GCSObjectStorageSettings::BlobStorageLogWriterFactory blob_storage_log_writer_factory = {})
+    GCSObjectStorageSettings::BlobStorageLogWriterFactory blob_storage_log_writer_factory = {},
+    std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth = nullptr)
 {
     fake_stub->use_object_map = true;
 
@@ -201,7 +229,8 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
     settings.client_settings.for_disk = true;
     settings.blob_storage_log_writer_factory = std::move(blob_storage_log_writer_factory);
 
-    return std::make_shared<GCSObjectStorage>(settings, std::make_shared<GCS::Client>(settings.client_settings, fake_stub));
+    return std::make_shared<GCSObjectStorage>(
+        settings, std::make_shared<GCS::Client>(settings.client_settings, fake_stub, std::move(auth)));
 }
 
 void addFakeObject(const std::shared_ptr<GCS::FakeStub> & fake_stub, const String & path, const String & data = {})
@@ -442,6 +471,66 @@ TEST(GCSObjectStorageCore, FakeIteratorStatusAndDeleteFailures)
     EXPECT_THROW(storage->removeObjectIfExists(first), Exception);
 }
 
+TEST(GCSObjectStorageReadBuffer, SequentialReadsUseSingleStreamAcrossBufferRefills)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    const String payload = "abcdefghijklmnopqrstuvwxyz";
+    auto object = writeFakeObject(storage, "clickhouse-data/sequential", payload);
+    auto settings = readSettings(4);
+
+    fake_stub->read_object_requests.clear();
+    auto in = storage->readObject(object, settings, {});
+    EXPECT_EQ(payload, readAll(*in));
+
+    ASSERT_EQ(1, fake_stub->read_object_requests.size());
+    EXPECT_EQ(0, fake_stub->read_object_requests.front().read_offset());
+    EXPECT_EQ(static_cast<int64_t>(payload.size()), fake_stub->read_object_requests.front().read_limit());
+
+
+    const String multi_window_payload(100, 'm');
+    auto multi_window_object = writeFakeObject(storage, "clickhouse-data/sequential-multi-window", multi_window_payload);
+    settings.prefetch_buffer_size = 8;
+    fake_stub->read_object_requests.clear();
+    auto multi_window_in = storage->readObject(multi_window_object, settings, {});
+    EXPECT_EQ(multi_window_payload, readAll(*multi_window_in));
+    ASSERT_EQ(2, fake_stub->read_object_requests.size());
+    EXPECT_EQ(0, fake_stub->read_object_requests[0].read_offset());
+    EXPECT_EQ(64, fake_stub->read_object_requests[0].read_limit());
+    EXPECT_EQ(64, fake_stub->read_object_requests[1].read_offset());
+    EXPECT_EQ(36, fake_stub->read_object_requests[1].read_limit());
+}
+
+TEST(GCSObjectStorageReadBuffer, ReadHintAndPrefetchBoundSequentialWindows)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    const String payload = "abcdefghij";
+    auto object = writeFakeObject(storage, "clickhouse-data/read-hint", payload);
+    StoredObject unknown_size_object(object.remote_path, object.local_path);
+    auto settings = readSettings(4);
+
+    fake_stub->read_object_requests.clear();
+    auto hinted_in = storage->readObject(unknown_size_object, settings, 6);
+    EXPECT_EQ(payload, readAll(*hinted_in));
+    ASSERT_EQ(2, fake_stub->read_object_requests.size());
+    EXPECT_EQ(0, fake_stub->read_object_requests[0].read_offset());
+    EXPECT_EQ(6, fake_stub->read_object_requests[0].read_limit());
+    EXPECT_EQ(6, fake_stub->read_object_requests[1].read_offset());
+    EXPECT_EQ(6, fake_stub->read_object_requests[1].read_limit());
+
+    settings.remote_fs_prefetch = true;
+    settings.prefetch_buffer_size = 6;
+    fake_stub->read_object_requests.clear();
+    auto prefetch_in = storage->readObject(unknown_size_object, settings, {});
+    EXPECT_EQ(payload, readAll(*prefetch_in));
+    ASSERT_EQ(2, fake_stub->read_object_requests.size());
+    EXPECT_EQ(0, fake_stub->read_object_requests[0].read_offset());
+    EXPECT_EQ(6, fake_stub->read_object_requests[0].read_limit());
+    EXPECT_EQ(6, fake_stub->read_object_requests[1].read_offset());
+    EXPECT_EQ(6, fake_stub->read_object_requests[1].read_limit());
+}
+
 TEST(GCSObjectStorageReadBuffer, SeekPositionAndOffsetContracts)
 {
     auto fake_stub = std::make_shared<GCS::FakeStub>();
@@ -449,20 +538,47 @@ TEST(GCSObjectStorageReadBuffer, SeekPositionAndOffsetContracts)
     auto object = writeFakeObject(storage, "clickhouse-data/seek", "0123456789");
     auto settings = readSettings(4);
 
+    fake_stub->read_object_requests.clear();
     auto in = storage->readObject(object, settings, {});
     EXPECT_EQ(0, in->getPosition());
     EXPECT_EQ("012", readBytes(*in, 3));
     EXPECT_EQ(3, in->getPosition());
     EXPECT_EQ(4, in->getFileOffsetOfBufferEnd());
+    ASSERT_EQ(1, fake_stub->read_object_requests.size());
+    EXPECT_EQ(0, fake_stub->read_object_requests.back().read_offset());
 
     EXPECT_EQ(5, in->seek(5, SEEK_SET));
     EXPECT_EQ("56", readBytes(*in, 2));
+    ASSERT_EQ(2, fake_stub->read_object_requests.size());
+    EXPECT_EQ(5, fake_stub->read_object_requests.back().read_offset());
+
     EXPECT_EQ(4, in->seek(-3, SEEK_CUR));
     EXPECT_EQ("45", readBytes(*in, 2));
+    ASSERT_EQ(3, fake_stub->read_object_requests.size());
+    EXPECT_EQ(4, fake_stub->read_object_requests.back().read_offset());
 
     EXPECT_THROW(in->seek(-100, SEEK_CUR), Exception);
     EXPECT_THROW(in->seek(11, SEEK_SET), Exception);
 }
+
+TEST(GCSObjectStorageReadBuffer, SeekSurfacesActiveStreamFinishFailure)
+{
+    resetProfileEvents();
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    fake_stub->use_object_map = false;
+
+    google::storage::v2::ReadObjectResponse response;
+    response.mutable_checksummed_data()->set_content("abcdef");
+    fake_stub->read_object_responses = {response};
+    fake_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "unavailable");
+
+    auto in = storage->readObject(StoredObject("clickhouse-data/seek-fails", "seek-fails", 6), readSettings(4), {});
+    EXPECT_EQ("ab", readBytes(*in, 2));
+    EXPECT_THROW(in->seek(0, SEEK_SET), Exception);
+    EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+}
+
 
 TEST(GCSObjectStorageReadBuffer, RangeReadsAndEOF)
 {
@@ -474,7 +590,11 @@ TEST(GCSObjectStorageReadBuffer, RangeReadsAndEOF)
     EXPECT_EQ("", readAll(*storage->readObject(empty, settings, {})));
 
     auto exact = writeFakeObject(storage, "clickhouse-data/exact", "abcd");
-    EXPECT_EQ("abcd", readAll(*storage->readObject(exact, settings, {})));
+    auto exact_in = storage->readObject(exact, settings, {});
+    EXPECT_TRUE(exact_in->supportsRightBoundedReads());
+    ASSERT_TRUE(exact_in->getRemoteFileSize().has_value());
+    EXPECT_EQ(4, *exact_in->getRemoteFileSize());
+    EXPECT_EQ("abcd", readAll(*exact_in));
 
     auto object = writeFakeObject(storage, "clickhouse-data/range", "abcdefghij");
     fake_stub->read_object_requests.clear();
@@ -487,26 +607,167 @@ TEST(GCSObjectStorageReadBuffer, RangeReadsAndEOF)
     EXPECT_EQ(4, fake_stub->read_object_requests.back().read_limit());
 
     StoredObject bounded(object.remote_path, object.local_path, 3);
+    fake_stub->read_object_requests.clear();
     EXPECT_EQ("abc", readAll(*storage->readObject(bounded, settings, {})));
     ASSERT_FALSE(fake_stub->read_object_requests.empty());
-    EXPECT_EQ(3, fake_stub->read_object_requests.back().read_limit());
+    EXPECT_EQ(3, fake_stub->read_object_requests.front().read_limit());
+
+    auto bounded_in = storage->readObject(bounded, settings, {});
+    String bounded_buffer(4, '\0');
+    EXPECT_EQ(1, bounded_in->readBigAt(bounded_buffer.data(), bounded_buffer.size(), 2, {}));
+    EXPECT_EQ('c', bounded_buffer[0]);
+    EXPECT_EQ(0, bounded_in->readBigAt(bounded_buffer.data(), bounded_buffer.size(), 3, {}));
+
+
+    String cancellable_buffer(6, '\0');
+    size_t callback_calls = 0;
+    auto cancellable_in = storage->readObject(object, settings, {});
+    EXPECT_EQ(
+        4,
+        cancellable_in->readBigAt(
+            cancellable_buffer.data(),
+            cancellable_buffer.size(),
+            0,
+            [&](size_t copied)
+            {
+                ++callback_calls;
+                return copied >= 4;
+            }));
+    EXPECT_EQ("abcd", cancellable_buffer.substr(0, 4));
+    EXPECT_EQ(1, callback_calls);
+
+
+    auto cancel_stub = std::make_shared<GCS::FakeStub>();
+    auto cancel_storage = makeFakeGCSObjectStorage(cancel_stub);
+    cancel_stub->use_object_map = false;
+    google::storage::v2::ReadObjectResponse cancel_response;
+    cancel_response.mutable_checksummed_data()->set_content("abcdef");
+    cancel_stub->read_object_responses = {cancel_response};
+    cancel_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "cancelled");
+    String cancel_buffer(6, '\0');
+    auto cancel_in = cancel_storage->readObject(StoredObject("clickhouse-data/cancel", "cancel", 6), settings, {});
+    EXPECT_EQ(
+        4,
+        cancel_in->readBigAt(
+            cancel_buffer.data(),
+            cancel_buffer.size(),
+            0,
+            [](size_t copied) { return copied >= 4; }));
+}
+TEST(GCSObjectStorageReadBuffer, ReadFailuresAndAccounting)
+{
+    {
+        resetProfileEvents();
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto auth = std::make_shared<FailingAuth>(
+            google::cloud::Status(google::cloud::StatusCode::kPermissionDenied, "auth denied"));
+        auto storage = makeFakeGCSObjectStorage(fake_stub, /* read_only */ false, {}, {}, auth);
+
+        auto in = storage->readObject(StoredObject("clickhouse-data/auth", "auth", 3), readSettings(4), {});
+        EXPECT_THROW(readAll(*in), Exception);
+        EXPECT_TRUE(fake_stub->read_object_requests.empty());
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+    }
+
+    {
+        resetProfileEvents();
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        fake_stub->use_object_map = false;
+        fake_stub->read_object_null_streams = 1;
+
+        auto in = storage->readObject(StoredObject("clickhouse-data/null-stream", "null-stream", 3), readSettings(4), {});
+        EXPECT_THROW(readAll(*in), Exception);
+        ASSERT_EQ(1, fake_stub->read_object_requests.size());
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+    }
+
+    {
+        resetProfileEvents();
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        fake_stub->use_object_map = false;
+        google::storage::v2::ReadObjectResponse response;
+        response.mutable_checksummed_data()->set_content("ab");
+        fake_stub->read_object_responses = {response};
+
+        auto in = storage->readObject(StoredObject("clickhouse-data/short", "short", 4), readSettings(4), {});
+        EXPECT_THROW(readAll(*in), Exception);
+        ASSERT_EQ(1, fake_stub->read_object_requests.size());
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+    }
+
+    {
+        resetProfileEvents();
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        CapturedBlobStorageLog captured_log;
+        auto storage = makeFakeGCSObjectStorage(
+            fake_stub,
+            /* read_only */ false,
+            {},
+            [&](const String & disk_name) { return captured_log.createWriter(disk_name); });
+        addFakeObject(fake_stub, "clickhouse-data/accounting", "abcd");
+
+        auto settings = readSettings(4);
+        settings.enable_blob_storage_log_for_read_operations = true;
+        EXPECT_EQ("abcd", readAll(*storage->readObject(StoredObject("clickhouse-data/accounting", "accounting", 4), settings, {})));
+        EXPECT_EQ(4, profileEventValue(ProfileEvents::ReadBufferFromGCSBytes));
+
+        auto logs = captured_log.drain();
+        ASSERT_EQ(1, logs.size());
+        EXPECT_EQ(BlobStorageLogElement::EventType::Read, logs.front().event_type);
+        EXPECT_EQ(4, logs.front().data_size);
+        EXPECT_EQ(0, logs.front().error_code);
+    }
 }
 
 TEST(GCSObjectStorageReadBuffer, StreamFinishFailure)
 {
-    auto fake_stub = std::make_shared<GCS::FakeStub>();
-    auto storage = makeFakeGCSObjectStorage(fake_stub);
-    fake_stub->use_object_map = false;
+    {
+        resetProfileEvents();
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        CapturedBlobStorageLog captured_log;
+        auto storage = makeFakeGCSObjectStorage(
+            fake_stub,
+            /* read_only */ false,
+            {},
+            [&](const String & disk_name) { return captured_log.createWriter(disk_name); });
+        fake_stub->use_object_map = false;
 
-    google::storage::v2::ReadObjectResponse response;
-    response.mutable_checksummed_data()->set_content("abc");
-    fake_stub->read_object_responses = {response};
-    fake_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "unavailable");
+        google::storage::v2::ReadObjectResponse response;
+        response.mutable_checksummed_data()->set_content("abc");
+        fake_stub->read_object_responses = {response};
+        fake_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "unavailable");
 
-    auto in = storage->readObject(StoredObject("clickhouse-data/fails", "fails", 3), readSettings(4), {});
-    EXPECT_THROW(readAll(*in), Exception);
-    ASSERT_EQ(1, fake_stub->read_object_requests.size());
-    EXPECT_EQ("clickhouse-data/fails", fake_stub->read_object_requests.front().object());
+        auto settings = readSettings(4);
+        settings.enable_blob_storage_log_for_read_operations = true;
+        auto in = storage->readObject(StoredObject("clickhouse-data/fails", "fails", 3), settings, {});
+        EXPECT_THROW(readAll(*in), Exception);
+        ASSERT_EQ(1, fake_stub->read_object_requests.size());
+        EXPECT_EQ("clickhouse-data/fails", fake_stub->read_object_requests.front().object());
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+
+        auto logs = captured_log.drain();
+        ASSERT_EQ(1, logs.size());
+        EXPECT_EQ(BlobStorageLogElement::EventType::Read, logs.front().event_type);
+        EXPECT_NE(0, logs.front().error_code);
+    }
+
+    {
+        resetProfileEvents();
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        fake_stub->use_object_map = false;
+
+        google::storage::v2::ReadObjectResponse response;
+        response.mutable_checksummed_data()->set_content("abcd");
+        fake_stub->read_object_responses = {response};
+        fake_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::UNAVAILABLE, "unavailable");
+
+        auto in = storage->readObject(StoredObject("clickhouse-data/exact-fails", "exact-fails", 4), readSettings(4), {});
+        EXPECT_THROW(readAll(*in), Exception);
+        EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+    }
 }
 
 TEST(GCSObjectStorageWriteBuffer, EmptySmallAndChunkedWrites)
