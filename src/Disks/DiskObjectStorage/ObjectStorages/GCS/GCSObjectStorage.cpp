@@ -171,7 +171,7 @@ public:
     {
         try
         {
-            finishSequentialStream(/* require_expected_bytes */ false);
+            finishSequentialStream(/* require_expected_bytes */ false, /* cancel_before_finish */ true);
         }
         catch (...)
         {
@@ -364,10 +364,13 @@ private:
         }
     }
 
-    void finishSequentialStream(bool require_expected_bytes = true)
+    void finishSequentialStream(bool require_expected_bytes = true, bool cancel_before_finish = false)
     {
         if (!sequential_stream)
             return;
+
+        if (cancel_before_finish && sequential_stream->result.context)
+            sequential_stream->result.context->TryCancel();
 
         const auto finish_status = GCS::fromGrpcStatus(sequential_stream->result.stream->Finish());
         const auto bytes_read_from_stream = sequential_stream->bytes_read_from_stream;
@@ -375,7 +378,11 @@ private:
         sequential_stream.reset();
 
         if (!finish_status.ok())
+        {
+            if (cancel_before_finish && isExpectedCancellationStatus(finish_status))
+                return;
             GCS::throwIfError(finish_status, "ReadObject");
+        }
 
         if (require_expected_bytes && file_size && limit && bytes_read_from_stream < *limit)
             throw Exception(
@@ -392,6 +399,11 @@ private:
         }
         if (!limit || bytes_read_from_stream < *limit)
             sequential_eof = true;
+    }
+
+    static bool isExpectedCancellationStatus(const GCS::Status & status)
+    {
+        return status.code == GCS::StatusCode::DeadlineExceeded;
     }
 
     size_t copyPending(char * to, size_t limit)

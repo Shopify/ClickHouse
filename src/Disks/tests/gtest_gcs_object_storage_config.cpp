@@ -817,6 +817,25 @@ TEST(GCSObjectStorageReadBuffer, SeekSurfacesActiveStreamFinishFailure)
     EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
 }
 
+TEST(GCSObjectStorageReadBuffer, DestructorCancelsUnfinishedSequentialStream)
+{
+    resetProfileEvents();
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    fake_stub->use_object_map = false;
+
+    google::storage::v2::ReadObjectResponse response;
+    response.mutable_checksummed_data()->set_content("abcdef");
+    fake_stub->read_object_responses = {response};
+    fake_stub->read_object_finish_status = grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "deadline");
+
+    auto in = storage->readObject(StoredObject("clickhouse-data/destructor-cancel", "destructor-cancel", 6), readSettings(4), {});
+    EXPECT_EQ("ab", readBytes(*in, 2));
+    in.reset();
+
+    EXPECT_EQ(0, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
+}
+
 
 TEST(GCSObjectStorageReadBuffer, RangeReadsAndEOF)
 {
