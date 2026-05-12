@@ -997,13 +997,17 @@ grpc::Status FakeStub::rewriteObject(
         if (it == objects.end())
             return grpc::Status(grpc::StatusCode::NOT_FOUND, "fake rewrite source object not found");
 
+        const auto destination_key = fakeObjectKey(request.destination_bucket(), request.destination_name());
+        if (request.has_if_generation_match() && request.if_generation_match() == 0 && objects.contains(destination_key))
+            return grpc::Status(grpc::StatusCode::ALREADY_EXISTS, "fake rewrite destination already exists");
+
         FakeObject object;
         object.data = it->second.data;
         object.metadata = request.has_destination() ? request.destination() : it->second.metadata;
         object.metadata.set_bucket(request.destination_bucket());
         object.metadata.set_name(request.destination_name());
         object.metadata.set_size(static_cast<int64_t>(object.data.size()));
-        objects[fakeObjectKey(object.metadata.bucket(), object.metadata.name())] = object;
+        objects[destination_key] = object;
 
         response.set_done(true);
         response.set_total_bytes_rewritten(static_cast<int64_t>(object.data.size()));

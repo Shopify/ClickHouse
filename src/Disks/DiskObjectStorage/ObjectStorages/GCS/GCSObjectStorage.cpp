@@ -112,7 +112,25 @@ ObjectMetadata metadataFromProto(const google::storage::v2::Object & object, boo
     return metadata;
 }
 
+void validateNativeGCSWriteSettings(const WriteSettings & write_settings)
+{
+    if (!write_settings.object_storage_write_if_match.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage does not support object_storage_write_if_match");
+    if (!write_settings.object_storage_write_if_none_match.empty() && write_settings.object_storage_write_if_none_match != "*")
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Native GCS object storage supports only '*' for object_storage_write_if_none_match, got '{}'",
+            write_settings.object_storage_write_if_none_match);
+}
 
+void applyObjectAttributes(google::storage::v2::Object & resource, const std::optional<ObjectAttributes> & attributes)
+{
+    if (!attributes)
+        return;
+
+    for (const auto & [key, value] : *attributes)
+        (*resource.mutable_metadata())[key] = value;
+}
 
 String statusLogMessage(const GCS::Status & status)
 {
@@ -749,11 +767,7 @@ private:
 
     void applyAttributes(google::storage::v2::Object & resource) const
     {
-        if (!attributes)
-            return;
-
-        for (const auto & [key, value] : *attributes)
-            (*resource.mutable_metadata())[key] = value;
+        applyObjectAttributes(resource, attributes);
     }
 
     void applyWritePreconditions(google::storage::v2::WriteObjectSpec & spec) const
@@ -1213,13 +1227,7 @@ std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage supports only WriteMode::Rewrite");
     if (settings.read_only)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage disk '{}' is read-only", settings.disk_name);
-    if (!write_settings.object_storage_write_if_match.empty())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage does not support object_storage_write_if_match");
-    if (!write_settings.object_storage_write_if_none_match.empty() && write_settings.object_storage_write_if_none_match != "*")
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "Native GCS object storage supports only '*' for object_storage_write_if_none_match, got '{}'",
-            write_settings.object_storage_write_if_none_match);
+    validateNativeGCSWriteSettings(write_settings);
 
     auto blob_storage_log = createBlobStorageLogWriter();
     if (blob_storage_log)
@@ -1288,6 +1296,57 @@ void GCSObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
         removeObjectIfExistsImpl(object, blob_storage_log);
 }
 
+#if USE_GOOGLE_CLOUD
+bool GCSObjectStorage::isCompatibleForNativeRewriteFrom(const GCSObjectStorage & source_storage) const
+{
+    const auto & destination_settings = settings.client_settings;
+    const auto & source_settings = source_storage.settings.client_settings;
+    return destination_settings.endpoint == source_settings.endpoint
+        && GCS::credentialMode(destination_settings) == GCS::credentialMode(source_settings)
+        && destination_settings.service_account_json == source_settings.service_account_json
+        && destination_settings.user_project == source_settings.user_project
+        && destination_settings.use_insecure_credentials_for_tests == source_settings.use_insecure_credentials_for_tests;
+}
+
+void GCSObjectStorage::rewriteObjectFromGCS(
+    const GCSObjectStorage & source_storage,
+    const StoredObject & object_from,
+    const StoredObject & object_to,
+    const WriteSettings & write_settings,
+    std::optional<ObjectAttributes> object_to_attributes) const
+{
+    if (settings.read_only)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage disk '{}' is read-only", settings.disk_name);
+
+    validateNativeGCSWriteSettings(write_settings);
+
+    google::storage::v2::RewriteObjectRequest request;
+    request.set_source_bucket(bucketResourceName(source_storage.settings.bucket));
+    request.set_source_object(objectName(object_from.remote_path));
+    request.set_destination_bucket(bucketResourceName(settings.bucket));
+    request.set_destination_name(objectName(object_to.remote_path));
+    if (object_to_attributes)
+        applyObjectAttributes(*request.mutable_destination(), object_to_attributes);
+    if (write_settings.object_storage_write_if_none_match == "*")
+        request.set_if_generation_match(0);
+
+    while (true)
+    {
+        auto result = client->rewriteObject(request);
+        GCS::throwIfError(result.status, "RewriteObject");
+        if (result.response.done())
+            return;
+        if (result.response.rewrite_token().empty())
+            throw Exception(
+                ErrorCodes::S3_ERROR,
+                "GCS gRPC RewriteObject from '{}' to '{}' returned an incomplete response without rewrite token",
+                object_from.remote_path,
+                object_to.remote_path);
+        request.set_rewrite_token(result.response.rewrite_token());
+    }
+}
+#endif
+
 void GCSObjectStorage::copyObject(
     const StoredObject & object_from,
     const StoredObject & object_to,
@@ -1295,10 +1354,15 @@ void GCSObjectStorage::copyObject(
     const WriteSettings & write_settings,
     std::optional<ObjectAttributes> object_to_attributes)
 {
+#if USE_GOOGLE_CLOUD
+    (void)read_settings;
+    rewriteObjectFromGCS(*this, object_from, object_to, write_settings, std::move(object_to_attributes));
+#else
     auto in = readObject(object_from, read_settings);
     auto out = writeObject(object_to, WriteMode::Rewrite, std::move(object_to_attributes), DBMS_DEFAULT_BUFFER_SIZE, write_settings);
     copyData(*in, *out);
     out->finalize();
+#endif
 }
 
 void GCSObjectStorage::copyObjectToAnotherObjectStorage(
@@ -1314,6 +1378,16 @@ void GCSObjectStorage::copyObjectToAnotherObjectStorage(
         copyObject(object_from, object_to, read_settings, write_settings, std::move(object_to_attributes));
         return;
     }
+
+#if USE_GOOGLE_CLOUD
+    if (auto * destination_gcs = dynamic_cast<GCSObjectStorage *>(&object_storage_to);
+        destination_gcs != nullptr && destination_gcs->isCompatibleForNativeRewriteFrom(*this))
+    {
+        (void)read_settings;
+        destination_gcs->rewriteObjectFromGCS(*this, object_from, object_to, write_settings, std::move(object_to_attributes));
+        return;
+    }
+#endif
 
     auto in = readObject(object_from, read_settings);
     auto out = object_storage_to.writeObject(

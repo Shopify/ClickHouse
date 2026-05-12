@@ -83,6 +83,15 @@ public:
 private:
     BlobStorageLogWriterPtr createBlobStorageLogWriter() const;
     void removeObjectIfExistsImpl(const StoredObject & object, const BlobStorageLogWriterPtr & blob_storage_log) const;
+#if USE_GOOGLE_CLOUD
+    bool isCompatibleForNativeRewriteFrom(const GCSObjectStorage & source_storage) const;
+    void rewriteObjectFromGCS(
+        const GCSObjectStorage & source_storage,
+        const StoredObject & object_from,
+        const StoredObject & object_to,
+        const WriteSettings & write_settings,
+        std::optional<ObjectAttributes> object_to_attributes) const;
+#endif
 
     [[noreturn]] void throwNotImplemented(std::string_view operation) const;
     GCSObjectStorageSettings settings;

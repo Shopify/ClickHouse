@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Local/MetadataStorageFromDisk.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageFactory.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
@@ -214,17 +215,20 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
     bool read_only = false,
     GCS::ClientSettings client_settings = {},
     GCSObjectStorageSettings::BlobStorageLogWriterFactory blob_storage_log_writer_factory = {},
-    std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth = nullptr)
+    std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth = nullptr,
+    String bucket = "native-bucket",
+    String endpoint = "storage.googleapis.com")
 {
     fake_stub->use_object_map = true;
 
     GCSObjectStorageSettings settings;
     settings.disk_name = "native_gcs_disk";
-    settings.bucket = "native-bucket";
+    settings.bucket = std::move(bucket);
     settings.key_prefix = "clickhouse-data/";
-    settings.description = "fake/native-bucket";
+    settings.description = "fake/" + settings.bucket;
     settings.read_only = read_only;
     settings.client_settings = std::move(client_settings);
+    settings.client_settings.endpoint = std::move(endpoint);
     settings.client_settings.use_insecure_credentials_for_tests = true;
     settings.client_settings.for_disk = true;
     settings.blob_storage_log_writer_factory = std::move(blob_storage_log_writer_factory);
@@ -233,19 +237,23 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
         settings, std::make_shared<GCS::Client>(settings.client_settings, fake_stub, std::move(auth)));
 }
 
-String fakeObjectMapKey(const String & path)
+String fakeObjectMapKey(const String & path, const String & bucket = "native-bucket")
 {
-    return "projects/_/buckets/native-bucket\n" + path;
+    return "projects/_/buckets/" + bucket + "\n" + path;
 }
 
-void addFakeObject(const std::shared_ptr<GCS::FakeStub> & fake_stub, const String & path, const String & data = {})
+void addFakeObject(
+    const std::shared_ptr<GCS::FakeStub> & fake_stub,
+    const String & path,
+    const String & data = {},
+    const String & bucket = "native-bucket")
 {
     GCS::FakeStub::FakeObject object;
     object.data = data;
-    object.metadata.set_bucket("projects/_/buckets/native-bucket");
+    object.metadata.set_bucket("projects/_/buckets/" + bucket);
     object.metadata.set_name(path);
     object.metadata.set_size(static_cast<int64_t>(data.size()));
-    fake_stub->objects["projects/_/buckets/native-bucket\n" + path] = std::move(object);
+    fake_stub->objects[fakeObjectMapKey(path, bucket)] = std::move(object);
 }
 
 StoredObject writeFakeObject(
@@ -439,6 +447,231 @@ TEST(GCSObjectStorageCore, FakeReadWriteListDeleteAndCopy)
     EXPECT_FALSE(storage->exists(object));
     storage->removeObjectIfExists(object);
     EXPECT_TRUE(storage->exists(copied));
+}
+
+
+TEST(GCSObjectStorageRewriteCopy, SameStorageCopyUsesRewriteObject)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    auto source = writeFakeObject(storage, "clickhouse-data/rewrite-source", "abcdef", {{"owner", "source"}});
+
+    fake_stub->read_object_requests.clear();
+    fake_stub->write_object_requests.clear();
+    fake_stub->rewrite_object_requests.clear();
+
+    StoredObject destination("clickhouse-data/rewrite-destination", "rewrite-destination");
+    storage->copyObject(source, destination, {}, {}, ObjectAttributes{{"owner", "copy"}});
+
+    ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+    EXPECT_TRUE(fake_stub->read_object_requests.empty());
+    EXPECT_TRUE(fake_stub->write_object_requests.empty());
+    const auto & request = fake_stub->rewrite_object_requests.front();
+    EXPECT_EQ("projects/_/buckets/native-bucket", request.source_bucket());
+    EXPECT_EQ(source.remote_path, request.source_object());
+    EXPECT_EQ("projects/_/buckets/native-bucket", request.destination_bucket());
+    EXPECT_EQ(destination.remote_path, request.destination_name());
+    ASSERT_TRUE(request.has_destination());
+    EXPECT_EQ("copy", request.destination().metadata().at("owner"));
+
+    ASSERT_TRUE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    const auto & copied = fake_stub->objects.at(fakeObjectMapKey(destination.remote_path));
+    EXPECT_EQ("abcdef", copied.data);
+    EXPECT_EQ("copy", copied.metadata.metadata().at("owner"));
+}
+
+TEST(GCSObjectStorageRewriteCopy, RewriteTokenIterationUsesContinuationToken)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+
+    google::storage::v2::RewriteResponse first_response;
+    first_response.set_done(false);
+    first_response.set_rewrite_token("token-1");
+    google::storage::v2::RewriteResponse second_response;
+    second_response.set_done(true);
+    fake_stub->rewrite_object_responses = {first_response, second_response};
+
+    StoredObject source("clickhouse-data/token-source", "token-source");
+    StoredObject destination("clickhouse-data/token-destination", "token-destination");
+    storage->copyObject(source, destination, {}, {}, {});
+
+    ASSERT_EQ(2, fake_stub->rewrite_object_requests.size());
+    EXPECT_TRUE(fake_stub->rewrite_object_requests.front().rewrite_token().empty());
+    EXPECT_EQ("token-1", fake_stub->rewrite_object_requests.back().rewrite_token());
+    EXPECT_EQ(source.remote_path, fake_stub->rewrite_object_requests.back().source_object());
+    EXPECT_EQ(destination.remote_path, fake_stub->rewrite_object_requests.back().destination_name());
+}
+
+TEST(GCSObjectStorageRewriteCopy, RewriteMetadataAndPreconditions)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    addFakeObject(fake_stub, "clickhouse-data/precondition-source", "precondition-data");
+
+    WriteSettings write_settings;
+    write_settings.object_storage_write_if_none_match = "*";
+    StoredObject source("clickhouse-data/precondition-source", "precondition-source");
+    StoredObject destination("clickhouse-data/precondition-destination", "precondition-destination");
+    storage->copyObject(source, destination, {}, write_settings, ObjectAttributes{{"owner", "rewrite"}});
+
+    ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+    const auto & request = fake_stub->rewrite_object_requests.front();
+    EXPECT_TRUE(request.has_if_generation_match());
+    EXPECT_EQ(0, request.if_generation_match());
+    ASSERT_TRUE(request.has_destination());
+    EXPECT_EQ("rewrite", request.destination().metadata().at("owner"));
+
+    EXPECT_THROW(storage->copyObject(source, destination, {}, write_settings, {}), Exception);
+
+    WriteSettings if_match_settings;
+    if_match_settings.object_storage_write_if_match = "etag";
+    const auto requests_before_if_match = fake_stub->rewrite_object_requests.size();
+    EXPECT_THROW(storage->copyObject(source, StoredObject("clickhouse-data/if-match-copy", "if-match-copy"), {}, if_match_settings, {}), Exception);
+    EXPECT_EQ(requests_before_if_match, fake_stub->rewrite_object_requests.size());
+
+    WriteSettings unsupported_none_match;
+    unsupported_none_match.object_storage_write_if_none_match = "etag";
+    const auto requests_before_none_match = fake_stub->rewrite_object_requests.size();
+    EXPECT_THROW(
+        storage->copyObject(source, StoredObject("clickhouse-data/if-none-match-copy", "if-none-match-copy"), {}, unsupported_none_match, {}),
+        Exception);
+    EXPECT_EQ(requests_before_none_match, fake_stub->rewrite_object_requests.size());
+}
+
+TEST(GCSObjectStorageRewriteCopy, CompatibleGcsToGcsCopyUsesDestinationRewrite)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto source_storage = makeFakeGCSObjectStorage(fake_stub, false, {}, {}, nullptr, "source-bucket");
+    auto destination_storage = makeFakeGCSObjectStorage(fake_stub, false, {}, {}, nullptr, "destination-bucket");
+    addFakeObject(fake_stub, "clickhouse-data/cross-source", "cross-data", "source-bucket");
+
+    StoredObject source("clickhouse-data/cross-source", "cross-source");
+    StoredObject destination("clickhouse-data/cross-destination", "cross-destination");
+    source_storage->copyObjectToAnotherObjectStorage(
+        source, destination, {}, {}, *destination_storage, ObjectAttributes{{"owner", "destination"}});
+
+    ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+    EXPECT_TRUE(fake_stub->read_object_requests.empty());
+    EXPECT_TRUE(fake_stub->write_object_requests.empty());
+    const auto & request = fake_stub->rewrite_object_requests.front();
+    EXPECT_EQ("projects/_/buckets/source-bucket", request.source_bucket());
+    EXPECT_EQ("projects/_/buckets/destination-bucket", request.destination_bucket());
+
+    ASSERT_TRUE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path, "destination-bucket")));
+    const auto & copied = fake_stub->objects.at(fakeObjectMapKey(destination.remote_path, "destination-bucket"));
+    EXPECT_EQ("cross-data", copied.data);
+    EXPECT_EQ("destination", copied.metadata.metadata().at("owner"));
+}
+
+TEST(GCSObjectStorageRewriteCopy, SameEndpointDifferentAuthorityGcsCopyUsesGenericReadWrite)
+{
+    auto source_stub = std::make_shared<GCS::FakeStub>();
+    auto destination_stub = std::make_shared<GCS::FakeStub>();
+    GCS::ClientSettings source_settings;
+    source_settings.user_project = "source-project";
+    GCS::ClientSettings destination_settings;
+    destination_settings.user_project = "destination-project";
+    auto source_storage = makeFakeGCSObjectStorage(source_stub, false, source_settings, {}, nullptr, "source-bucket");
+    auto destination_storage = makeFakeGCSObjectStorage(destination_stub, false, destination_settings, {}, nullptr, "destination-bucket");
+    addFakeObject(source_stub, "clickhouse-data/generic-source", "generic-data", "source-bucket");
+
+    StoredObject source("clickhouse-data/generic-source", "generic-source", 12);
+    StoredObject destination("clickhouse-data/generic-destination", "generic-destination");
+    source_storage->copyObjectToAnotherObjectStorage(source, destination, {}, {}, *destination_storage, {});
+
+    EXPECT_TRUE(source_stub->rewrite_object_requests.empty());
+    EXPECT_FALSE(source_stub->read_object_requests.empty());
+    EXPECT_TRUE(destination_stub->rewrite_object_requests.empty());
+    EXPECT_FALSE(destination_stub->write_object_requests.empty());
+    ASSERT_TRUE(destination_stub->objects.contains(fakeObjectMapKey(destination.remote_path, "destination-bucket")));
+    EXPECT_EQ("generic-data", destination_stub->objects.at(fakeObjectMapKey(destination.remote_path, "destination-bucket")).data);
+}
+
+TEST(GCSObjectStorageRewriteCopy, NonGcsDestinationUsesGenericReadWrite)
+{
+    auto source_stub = std::make_shared<GCS::FakeStub>();
+    auto source_storage = makeFakeGCSObjectStorage(source_stub);
+    addFakeObject(source_stub, "clickhouse-data/local-source", "local-data");
+
+    Poco::TemporaryFile temp_dir;
+    temp_dir.createDirectories();
+    LocalObjectStorage local_storage(LocalObjectStorageSettings("local_disk", temp_dir.path(), false));
+    const auto destination_path = (std::filesystem::path(temp_dir.path()) / "copied.bin").string();
+
+    StoredObject source("clickhouse-data/local-source", "local-source", 10);
+    StoredObject destination(destination_path, destination_path);
+    source_storage->copyObjectToAnotherObjectStorage(source, destination, {}, {}, local_storage, {});
+
+    EXPECT_TRUE(source_stub->rewrite_object_requests.empty());
+    EXPECT_FALSE(source_stub->read_object_requests.empty());
+    auto in = local_storage.readObject(destination, {}, {});
+    EXPECT_EQ("local-data", readAll(*in));
+}
+
+TEST(GCSObjectStorageRewriteCopy, CrossGcsRewriteFailuresDoNotFallback)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto source_storage = makeFakeGCSObjectStorage(fake_stub, false, {}, {}, nullptr, "source-bucket");
+    auto destination_storage = makeFakeGCSObjectStorage(fake_stub, false, {}, {}, nullptr, "destination-bucket");
+    addFakeObject(fake_stub, "clickhouse-data/cross-failure-source", "cross-failure-data", "source-bucket");
+    fake_stub->rewrite_object_status = grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "cross rewrite denied");
+
+    StoredObject source("clickhouse-data/cross-failure-source", "cross-failure-source");
+    StoredObject destination("clickhouse-data/cross-failure-destination", "cross-failure-destination");
+    EXPECT_THROW(source_storage->copyObjectToAnotherObjectStorage(source, destination, {}, {}, *destination_storage, {}), Exception);
+
+    ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+    EXPECT_TRUE(fake_stub->read_object_requests.empty());
+    EXPECT_TRUE(fake_stub->write_object_requests.empty());
+    EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path, "destination-bucket")));
+}
+
+TEST(GCSObjectStorageRewriteCopy, RewriteFailuresDoNotFallback)
+{
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        StoredObject source("clickhouse-data/missing-source", "missing-source");
+        StoredObject destination("clickhouse-data/missing-destination", "missing-destination");
+
+        EXPECT_THROW(storage->copyObject(source, destination, {}, {}, {}), Exception);
+        ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+        EXPECT_TRUE(fake_stub->read_object_requests.empty());
+        EXPECT_TRUE(fake_stub->write_object_requests.empty());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    }
+
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        addFakeObject(fake_stub, "clickhouse-data/permission-source", "permission-data");
+        fake_stub->rewrite_object_status = grpc::Status(grpc::StatusCode::PERMISSION_DENIED, "rewrite denied");
+        StoredObject source("clickhouse-data/permission-source", "permission-source");
+        StoredObject destination("clickhouse-data/permission-destination", "permission-destination");
+
+        EXPECT_THROW(storage->copyObject(source, destination, {}, {}, {}), Exception);
+        ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+        EXPECT_TRUE(fake_stub->read_object_requests.empty());
+        EXPECT_TRUE(fake_stub->write_object_requests.empty());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    }
+
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        google::storage::v2::RewriteResponse incomplete_response;
+        incomplete_response.set_done(false);
+        fake_stub->rewrite_object_responses = {incomplete_response};
+        StoredObject source("clickhouse-data/incomplete-source", "incomplete-source");
+        StoredObject destination("clickhouse-data/incomplete-destination", "incomplete-destination");
+
+        EXPECT_THROW(storage->copyObject(source, destination, {}, {}, {}), Exception);
+        ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+        EXPECT_TRUE(fake_stub->read_object_requests.empty());
+        EXPECT_TRUE(fake_stub->write_object_requests.empty());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    }
 }
 
 TEST(GCSObjectStorageCore, FakeIteratorStatusAndDeleteFailures)
