@@ -1360,6 +1360,112 @@ TEST(GCSObjectStorageCore, ReadOnlyRejectsWritesAndInvalidNames)
     config->setString("disk.key_prefix", "/absolute");
     EXPECT_THROW(getGCSObjectStorageSettings("native_gcs_disk", *config, "disk", getContext().context), Exception);
 }
+TEST(GCSObjectStorageCore, ReadOnlyAndPreconditionsRejectBeforeFinalObjects)
+{
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto read_only_storage = makeFakeGCSObjectStorage(fake_stub, true);
+        addFakeObject(fake_stub, "clickhouse-data/read-only-source", "read-only-data");
+        StoredObject source("clickhouse-data/read-only-source", "read-only-source");
+        StoredObject destination("clickhouse-data/read-only-destination", "read-only-destination");
+
+        EXPECT_THROW(read_only_storage->writeObject(destination, WriteMode::Rewrite, {}, 4, {}), Exception);
+        EXPECT_THROW(read_only_storage->copyObject(source, destination, {}, {}, {}), Exception);
+        EXPECT_TRUE(fake_stub->write_object_requests.empty());
+        EXPECT_TRUE(fake_stub->rewrite_object_requests.empty());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    }
+
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto source_storage = makeFakeGCSObjectStorage(fake_stub, false, {}, {}, nullptr, "source-bucket");
+        auto read_only_destination = makeFakeGCSObjectStorage(fake_stub, true, {}, {}, nullptr, "destination-bucket");
+        addFakeObject(fake_stub, "clickhouse-data/cross-read-only-source", "cross-read-only-data", "source-bucket");
+        StoredObject source("clickhouse-data/cross-read-only-source", "cross-read-only-source");
+        StoredObject destination("clickhouse-data/cross-read-only-destination", "cross-read-only-destination");
+
+        EXPECT_THROW(source_storage->copyObjectToAnotherObjectStorage(source, destination, {}, {}, *read_only_destination, {}), Exception);
+        EXPECT_TRUE(fake_stub->rewrite_object_requests.empty());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path, "destination-bucket")));
+    }
+
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        const size_t max_chunk = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
+        String payload(max_chunk * 2 + 1, 'w');
+        WriteSettings if_match_settings;
+        if_match_settings.object_storage_write_if_match = "etag";
+        StoredObject destination("clickhouse-data/compose-if-match", "compose-if-match", payload.size());
+
+        EXPECT_THROW(storage->writeObject(destination, WriteMode::Rewrite, {}, max_chunk, if_match_settings), Exception);
+        EXPECT_TRUE(fake_stub->write_object_requests.empty());
+        EXPECT_TRUE(fake_stub->compose_object_requests.empty());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    }
+
+    {
+        auto fake_stub = std::make_shared<GCS::FakeStub>();
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
+        addFakeObject(fake_stub, "clickhouse-data/rewrite-if-none-match-source", "rewrite-data");
+        WriteSettings unsupported_none_match;
+        unsupported_none_match.object_storage_write_if_none_match = "etag";
+        StoredObject source("clickhouse-data/rewrite-if-none-match-source", "rewrite-if-none-match-source");
+        StoredObject destination("clickhouse-data/rewrite-if-none-match-destination", "rewrite-if-none-match-destination");
+
+        EXPECT_THROW(storage->copyObject(source, destination, {}, unsupported_none_match, {}), Exception);
+        EXPECT_TRUE(fake_stub->rewrite_object_requests.empty());
+        EXPECT_FALSE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    }
+}
+
+TEST(GCSObjectStorageCore, RepresentativeSettingsRemainCompatible)
+{
+    resetProfileEvents();
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(fake_stub);
+    const String payload = "abcdefghijklmnopqrstuvwxyz";
+    auto object = writeFakeObject(storage, "clickhouse-data/settings-source", payload);
+
+    auto read_settings = readSettings(4);
+    read_settings.remote_fs_method = RemoteFSReadMethod::read;
+    read_settings.remote_fs_prefetch = true;
+    read_settings.prefetch_buffer_size = 12;
+    read_settings.remote_read_min_bytes_for_seek = 2;
+    read_settings.enable_filesystem_cache = false;
+    read_settings.use_page_cache_for_object_storage = true;
+    read_settings.read_from_page_cache_if_exists_otherwise_bypass_cache = true;
+    read_settings.remote_throttler
+        = blockingThrottler(ProfileEvents::RemoteReadThrottlerBytes, ProfileEvents::RemoteReadThrottlerSleepMicroseconds);
+
+    fake_stub->read_object_requests.clear();
+    auto in = storage->readObject(object, read_settings, {});
+    EXPECT_EQ(payload, readAll(*in));
+    ASSERT_EQ(1, fake_stub->read_object_requests.size());
+    EXPECT_EQ(0, fake_stub->read_object_requests.front().read_offset());
+    EXPECT_EQ(static_cast<int64_t>(payload.size()), fake_stub->read_object_requests.front().read_limit());
+    EXPECT_EQ(payload.size(), profileEventValue(ProfileEvents::RemoteReadThrottlerBytes));
+
+    resetProfileEvents();
+    WriteSettings write_settings;
+    write_settings.enable_filesystem_cache_on_write_operations = true;
+    write_settings.use_adaptive_write_buffer = true;
+    write_settings.adaptive_write_buffer_initial_size = 5;
+    write_settings.s3_allow_parallel_part_upload = false;
+    write_settings.remote_throttler
+        = blockingThrottler(ProfileEvents::RemoteWriteThrottlerBytes, ProfileEvents::RemoteWriteThrottlerSleepMicroseconds);
+    StoredObject destination("clickhouse-data/settings-destination", "settings-destination", payload.size());
+    {
+        auto out = storage->writeObject(destination, WriteMode::Rewrite, {}, 4, write_settings);
+        writeString(payload, *out);
+        out->finalize();
+    }
+
+    ASSERT_TRUE(fake_stub->objects.contains(fakeObjectMapKey(destination.remote_path)));
+    EXPECT_EQ(payload, fake_stub->objects.at(fakeObjectMapKey(destination.remote_path)).data);
+    EXPECT_EQ(payload.size(), profileEventValue(ProfileEvents::RemoteWriteThrottlerBytes));
+}
+
 
 TEST(GCSObjectStorageCore, DeleteNotFoundAndMultiDelete)
 {
@@ -1581,7 +1687,7 @@ TEST(GCSObjectStorageObservability, BlobStorageLogRowsCaptureReadUploadDeleteAnd
     EXPECT_EQ("native_gcs_disk", failed_read->disk_name);
     EXPECT_EQ("native-bucket", failed_read->bucket);
     EXPECT_EQ("local/missing", failed_read->local_path);
-    EXPECT_EQ(3, failed_read->data_size);
+    EXPECT_EQ(0, failed_read->data_size);
     EXPECT_NE(0, failed_read->error_code);
     EXPECT_NE(std::string::npos, failed_read->error_message.find("NotFound"));
 }
@@ -1627,6 +1733,26 @@ TEST(GCSObjectStorageCore, FakeDiskObjectStorageLocalMetadataScenario)
     std::vector<String> files;
     disk->listFiles("dir", files);
     EXPECT_EQ(std::vector<String>{"file.txt"}, files);
+    fake_stub->read_object_requests.clear();
+    fake_stub->write_object_requests.clear();
+    fake_stub->rewrite_object_requests.clear();
+    disk->copyFile("dir/file.txt", *disk, "dir/copied.txt", {}, {}, {});
+    ASSERT_EQ(1, fake_stub->rewrite_object_requests.size());
+    EXPECT_TRUE(fake_stub->read_object_requests.empty());
+    EXPECT_TRUE(fake_stub->write_object_requests.empty());
+    auto copied = disk->readFile("dir/copied.txt", {}, {});
+    EXPECT_EQ("payload", readAll(*copied));
+
+    fake_stub->read_object_requests.clear();
+    fake_stub->write_object_requests.clear();
+    fake_stub->rewrite_object_requests.clear();
+    disk->moveFile("dir/copied.txt", "dir/moved.txt");
+    EXPECT_FALSE(disk->existsFile("dir/copied.txt"));
+    EXPECT_TRUE(disk->existsFile("dir/moved.txt"));
+    EXPECT_TRUE(fake_stub->rewrite_object_requests.empty());
+    EXPECT_TRUE(fake_stub->write_object_requests.empty());
+    auto moved = disk->readFile("dir/moved.txt", {}, {});
+    EXPECT_EQ("payload", readAll(*moved));
 
     {
         auto out = disk->writeFile("dir/file.txt", DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, {});
@@ -1635,9 +1761,10 @@ TEST(GCSObjectStorageCore, FakeDiskObjectStorageLocalMetadataScenario)
     }
     auto rewritten = disk->readFile("dir/file.txt", {}, {});
     EXPECT_EQ("rewritten", readAll(*rewritten));
-
     disk->removeFile("dir/file.txt");
     EXPECT_FALSE(disk->existsFile("dir/file.txt"));
+    disk->removeFile("dir/moved.txt");
+    EXPECT_FALSE(disk->existsFile("dir/moved.txt"));
     disk->shutdown();
 }
 #endif
