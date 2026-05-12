@@ -372,16 +372,16 @@ private:
         if (cancel_before_finish && sequential_stream->result.context)
             sequential_stream->result.context->TryCancel();
 
-        const auto finish_status = GCS::fromGrpcStatus(sequential_stream->result.stream->Finish());
+        const auto grpc_finish_status = sequential_stream->result.stream->Finish();
         const auto bytes_read_from_stream = sequential_stream->bytes_read_from_stream;
         const auto limit = sequential_stream->limit;
         sequential_stream.reset();
 
-        if (!finish_status.ok())
+        if (!grpc_finish_status.ok())
         {
-            if (cancel_before_finish && isExpectedCancellationStatus(finish_status))
+            if (cancel_before_finish && isExpectedCancellationStatus(grpc_finish_status))
                 return;
-            GCS::throwIfError(finish_status, "ReadObject");
+            GCS::throwIfError(GCS::fromGrpcStatus(grpc_finish_status), "ReadObject");
         }
 
         if (require_expected_bytes && file_size && limit && bytes_read_from_stream < *limit)
@@ -401,9 +401,9 @@ private:
             sequential_eof = true;
     }
 
-    static bool isExpectedCancellationStatus(const GCS::Status & status)
+    static bool isExpectedCancellationStatus(const grpc::Status & status)
     {
-        return status.code == GCS::StatusCode::DeadlineExceeded;
+        return status.error_code() == grpc::StatusCode::CANCELLED;
     }
 
     size_t copyPending(char * to, size_t limit)
@@ -1614,3 +1614,4 @@ ObjectStoragePtr createGCSObjectStorage(
 }
 
 }
+
