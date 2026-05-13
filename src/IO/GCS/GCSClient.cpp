@@ -16,6 +16,7 @@
 #    include <google/cloud/internal/unified_grpc_credentials.h>
 #    include <google/cloud/internal/url_encode.h>
 #    include <google/cloud/storage/grpc_plugin.h>
+#    include <google/cloud/storage/download_options.h>
 #    include <google/cloud/storage/retry_policy.h>
 #    include <grpcpp/test/client_context_test_peer.h>
 #endif
@@ -224,7 +225,7 @@ const OperationEvents write_object_events{
     false,
     true};
 
-Status fromCloudStatus(const google::cloud::Status & status)
+Status statusFromCloud(const google::cloud::Status & status)
 {
     if (status.ok())
         return {};
@@ -640,6 +641,11 @@ grpc::Status nextStatus(std::vector<grpc::Status> & statuses, const grpc::Status
     return status;
 }
 
+
+}
+Status fromCloudStatus(const google::cloud::Status & status)
+{
+    return statusFromCloud(status);
 }
 
 Client::Client(
@@ -664,7 +670,7 @@ std::unique_ptr<grpc::ClientContext> Client::makeContext(Status & status, const 
 
     status = {};
     if (auth && auth->RequiresConfigureContext())
-        status = fromCloudStatus(auth->ConfigureContext(*context));
+        status = statusFromCloud(auth->ConfigureContext(*context));
 
     return context;
 }
@@ -853,6 +859,42 @@ HighLevelClient::HighLevelClient(ClientSettings settings_, google::cloud::Option
     , client(std::move(client_))
 {
     configureRequestThrottlerEvents(settings);
+}
+
+HighLevelReadResult HighLevelClient::readObject(
+    const std::string & bucket, const std::string & object, size_t offset, std::optional<size_t> limit)
+{
+    HighLevelReadResult result;
+
+    throttleRequest(settings, read_object_events);
+    recordAttemptStart(read_object_events, settings.for_disk);
+
+    Stopwatch watch;
+    if (limit)
+    {
+        result.stream = client.ReadObject(
+            bucket,
+            object,
+            google::cloud::storage::ReadRange(
+                static_cast<std::int64_t>(offset), static_cast<std::int64_t>(offset + *limit)));
+    }
+    else
+    {
+        result.stream = client.ReadObject(bucket, object, google::cloud::storage::ReadFromOffset(static_cast<std::int64_t>(offset)));
+    }
+    recordAttemptTime(read_object_events, settings.for_disk, watch.elapsedMicroseconds());
+
+    result.status = fromCloudStatus(result.stream.status());
+    if (!result.status.ok())
+        recordFailure(read_object_events, settings.for_disk, result.status.code);
+
+    return result;
+}
+
+void HighLevelClient::recordReadObjectFailure(const Status & status) const
+{
+    if (!status.ok())
+        recordFailure(read_object_events, settings.for_disk, status.code);
 }
 
 std::shared_ptr<HighLevelClient> createHighLevelClient(const ClientSettings & settings)

@@ -25,9 +25,12 @@
 
 #if USE_GOOGLE_CLOUD
 #    include <absl/strings/cord.h>
+#    include <gmock/gmock.h>
+#    include <google/cloud/storage/internal/object_read_source.h>
+#    include <google/cloud/storage/internal/object_requests.h>
 #    include <google/cloud/storage/testing/mock_client.h>
 #endif
-#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -144,32 +147,6 @@ std::shared_ptr<Throttler> blockingThrottler(ProfileEvents::Event amount, Profil
     return std::make_shared<Throttler>(1000, 0, nullptr, amount, sleep);
 }
 
-class FailingAuth final : public google::cloud::internal::GrpcAuthenticationStrategy
-{
-public:
-    explicit FailingAuth(google::cloud::Status failure_)
-        : failure(std::move(failure_))
-    {
-    }
-
-    std::shared_ptr<grpc::Channel> CreateChannel(std::string const &, grpc::ChannelArguments const &) override
-    {
-        return grpc::CreateChannel("localhost", grpc::InsecureChannelCredentials());
-    }
-
-    bool RequiresConfigureContext() const override { return true; }
-
-    google::cloud::Status ConfigureContext(grpc::ClientContext &) override { return failure; }
-
-    google::cloud::future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>>
-    AsyncConfigureContext(std::shared_ptr<grpc::ClientContext>) override
-    {
-        return google::cloud::make_ready_future<google::cloud::StatusOr<std::shared_ptr<grpc::ClientContext>>>(failure);
-    }
-
-private:
-    google::cloud::Status failure;
-};
 
 class CapturedBlobStorageLog
 {
@@ -211,6 +188,168 @@ private:
     BlobStorageLogPtr log;
 };
 
+google::cloud::Status cloudStatusFromGrpcStatus(const grpc::Status & status)
+{
+    if (status.ok())
+        return {};
+
+    switch (status.error_code())
+    {
+        case grpc::StatusCode::NOT_FOUND:
+            return google::cloud::Status(google::cloud::StatusCode::kNotFound, status.error_message());
+        case grpc::StatusCode::PERMISSION_DENIED:
+        case grpc::StatusCode::UNAUTHENTICATED:
+            return google::cloud::Status(google::cloud::StatusCode::kPermissionDenied, status.error_message());
+        case grpc::StatusCode::DEADLINE_EXCEEDED:
+            return google::cloud::Status(google::cloud::StatusCode::kDeadlineExceeded, status.error_message());
+        case grpc::StatusCode::RESOURCE_EXHAUSTED:
+            return google::cloud::Status(google::cloud::StatusCode::kResourceExhausted, status.error_message());
+        case grpc::StatusCode::UNAVAILABLE:
+            return google::cloud::Status(google::cloud::StatusCode::kUnavailable, status.error_message());
+        case grpc::StatusCode::INVALID_ARGUMENT:
+        case grpc::StatusCode::FAILED_PRECONDITION:
+        case grpc::StatusCode::OUT_OF_RANGE:
+            return google::cloud::Status(google::cloud::StatusCode::kInvalidArgument, status.error_message());
+        case grpc::StatusCode::UNIMPLEMENTED:
+            return google::cloud::Status(google::cloud::StatusCode::kUnimplemented, status.error_message());
+        default:
+            return google::cloud::Status(google::cloud::StatusCode::kUnknown, status.error_message());
+    }
+}
+
+class FakeHighLevelObjectReadSource final : public google::cloud::storage::internal::ObjectReadSource
+{
+public:
+    FakeHighLevelObjectReadSource(String data_, google::cloud::Status finish_status_)
+        : data(std::move(data_))
+        , finish_status(std::move(finish_status_))
+    {
+    }
+
+    bool IsOpen() const override { return open; }
+
+    google::cloud::StatusOr<google::cloud::storage::internal::HttpResponse> Close() override
+    {
+        open = false;
+        return google::cloud::storage::internal::HttpResponse{google::cloud::storage::internal::kOk, {}, {}};
+    }
+
+    google::cloud::StatusOr<google::cloud::storage::internal::ReadSourceResult> Read(char * buffer, std::size_t size) override
+    {
+        if (!open)
+            return google::cloud::storage::internal::ReadSourceResult{
+                0, google::cloud::storage::internal::HttpResponse{google::cloud::storage::internal::kOk, {}, {}}};
+
+        if (position >= data.size())
+        {
+            open = false;
+            if (!finish_status.ok())
+                return finish_status;
+            return google::cloud::storage::internal::ReadSourceResult{
+                0, google::cloud::storage::internal::HttpResponse{google::cloud::storage::internal::kOk, {}, {}}};
+        }
+
+        const size_t bytes_to_copy = std::min(size, data.size() - position);
+        memcpy(buffer, data.data() + position, bytes_to_copy);
+        position += bytes_to_copy;
+
+        google::cloud::storage::internal::ReadSourceResult result{
+            bytes_to_copy, google::cloud::storage::internal::HttpResponse{google::cloud::storage::internal::kContinue, {}, {}}};
+        result.size = data.size();
+        return result;
+    }
+
+private:
+    String data;
+    google::cloud::Status finish_status;
+    size_t position = 0;
+    bool open = true;
+};
+
+std::pair<size_t, std::optional<size_t>> highLevelReadRange(
+    const google::cloud::storage::internal::ReadObjectRangeRequest & request)
+{
+    if (request.HasOption<google::cloud::storage::ReadRange>())
+    {
+        const auto range = request.GetOption<google::cloud::storage::ReadRange>().value();
+        const auto begin = std::max<std::int64_t>(0, range.begin);
+        const auto end = std::max(begin, range.end);
+        return {static_cast<size_t>(begin), static_cast<size_t>(end - begin)};
+    }
+
+    if (request.HasOption<google::cloud::storage::ReadFromOffset>())
+    {
+        const auto offset = std::max<std::int64_t>(0, request.GetOption<google::cloud::storage::ReadFromOffset>().value());
+        return {static_cast<size_t>(offset), std::nullopt};
+    }
+
+    return {0, std::nullopt};
+}
+
+String applyReadRange(String data, size_t offset, std::optional<size_t> limit)
+{
+    if (offset >= data.size())
+        return {};
+
+    const size_t bytes_to_keep = limit ? std::min(*limit, data.size() - offset) : data.size() - offset;
+    return data.substr(offset, bytes_to_keep);
+}
+
+std::shared_ptr<GCS::HighLevelClient> makeFakeHighLevelClient(
+    const std::shared_ptr<GCS::FakeStub> & fake_stub, const GCS::ClientSettings & settings)
+{
+    auto mock = std::make_shared<::testing::NiceMock<google::cloud::storage::testing::MockClient>>();
+    ON_CALL(*mock, ReadObject(::testing::_))
+        .WillByDefault(::testing::Invoke(
+            [fake_stub](const google::cloud::storage::internal::ReadObjectRangeRequest & request)
+                -> google::cloud::StatusOr<std::unique_ptr<google::cloud::storage::internal::ObjectReadSource>>
+            {
+                const auto [offset, limit] = highLevelReadRange(request);
+
+                google::storage::v2::ReadObjectRequest captured;
+                captured.set_bucket("projects/_/buckets/" + request.bucket_name());
+                captured.set_object(request.object_name());
+                captured.set_read_offset(static_cast<int64_t>(offset));
+                if (limit)
+                    captured.set_read_limit(static_cast<int64_t>(*limit));
+                fake_stub->read_object_requests.push_back(captured);
+
+                if (fake_stub->read_object_null_streams)
+                {
+                    --fake_stub->read_object_null_streams;
+                    return google::cloud::Status(google::cloud::StatusCode::kUnavailable, "fake ReadObject did not create a stream");
+                }
+
+                String data;
+                if (fake_stub->use_object_map)
+                {
+                    const auto key = captured.bucket() + "\n" + captured.object();
+                    auto it = fake_stub->objects.find(key);
+                    if (it == fake_stub->objects.end())
+                        return google::cloud::Status(google::cloud::StatusCode::kNotFound, "fake object not found");
+                    data = it->second.data;
+                }
+                else
+                {
+                    for (const auto & response : fake_stub->read_object_responses)
+                    {
+                        if (response.has_checksummed_data())
+                            data += cordToString(response.checksummed_data().content());
+                    }
+                }
+
+                data = applyReadRange(std::move(data), offset, limit);
+                std::unique_ptr<google::cloud::storage::internal::ObjectReadSource> source
+                    = std::make_unique<FakeHighLevelObjectReadSource>(
+                        std::move(data), cloudStatusFromGrpcStatus(fake_stub->read_object_finish_status));
+                return source;
+            }));
+
+    auto options = GCS::makeGrpcClientOptions(settings);
+    auto storage_client = google::cloud::storage::testing::UndecoratedClientFromMock(mock);
+    return std::make_shared<GCS::HighLevelClient>(settings, std::move(options), std::move(storage_client));
+}
+
 std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
     const std::shared_ptr<GCS::FakeStub> & fake_stub,
     bool read_only = false,
@@ -234,9 +373,13 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
     settings.client_settings.for_disk = true;
     settings.blob_storage_log_writer_factory = std::move(blob_storage_log_writer_factory);
 
+    auto high_level_client = makeFakeHighLevelClient(fake_stub, settings.client_settings);
     return std::make_shared<GCSObjectStorage>(
-        settings, std::make_shared<GCS::Client>(settings.client_settings, fake_stub, std::move(auth)));
+        settings,
+        std::make_shared<GCS::Client>(settings.client_settings, fake_stub, std::move(auth)),
+        std::move(high_level_client));
 }
+
 
 String fakeObjectMapKey(const String & path, const String & bucket = "native-bucket")
 {
@@ -961,13 +1104,11 @@ TEST(GCSObjectStorageReadBuffer, ReadFailuresAndAccounting)
     {
         resetProfileEvents();
         auto fake_stub = std::make_shared<GCS::FakeStub>();
-        auto auth = std::make_shared<FailingAuth>(
-            google::cloud::Status(google::cloud::StatusCode::kPermissionDenied, "auth denied"));
-        auto storage = makeFakeGCSObjectStorage(fake_stub, /* read_only */ false, {}, {}, auth);
+        auto storage = makeFakeGCSObjectStorage(fake_stub);
 
         auto in = storage->readObject(StoredObject("clickhouse-data/auth", "auth", 3), readSettings(4), {});
         EXPECT_THROW(readAll(*in), Exception);
-        EXPECT_TRUE(fake_stub->read_object_requests.empty());
+        ASSERT_EQ(1, fake_stub->read_object_requests.size());
         EXPECT_EQ(1, profileEventValue(ProfileEvents::ReadBufferFromGCSRequestsErrors));
     }
 

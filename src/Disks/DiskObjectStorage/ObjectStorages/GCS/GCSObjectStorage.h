@@ -27,7 +27,10 @@ class GCSObjectStorage final : public IObjectStorage
 {
 public:
 #if USE_GOOGLE_CLOUD
-    GCSObjectStorage(GCSObjectStorageSettings settings_, std::shared_ptr<GCS::Client> client_);
+    GCSObjectStorage(
+        GCSObjectStorageSettings settings_,
+        std::shared_ptr<GCS::Client> client_,
+        std::shared_ptr<GCS::HighLevelClient> high_level_client_);
 #else
     explicit GCSObjectStorage(GCSObjectStorageSettings settings_);
 #endif
@@ -97,6 +100,7 @@ private:
     GCSObjectStorageSettings settings;
 #if USE_GOOGLE_CLOUD
     std::shared_ptr<GCS::Client> client;
+    std::shared_ptr<GCS::HighLevelClient> high_level_client;
 #endif
 };
 

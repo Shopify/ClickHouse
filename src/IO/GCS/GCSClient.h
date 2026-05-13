@@ -11,7 +11,7 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <mutex>
+#include <optional>
 #include <vector>
 
 #if USE_GOOGLE_CLOUD
@@ -140,7 +140,16 @@ private:
 
 std::shared_ptr<Client> createClient(const ClientSettings & settings);
 
+Status fromCloudStatus(const google::cloud::Status & status);
 google::cloud::Options makeGrpcClientOptions(const ClientSettings & settings);
+
+struct HighLevelReadResult
+{
+    Status status;
+    google::cloud::storage::ObjectReadStream stream;
+
+    bool ok() const { return status.ok(); }
+};
 
 class HighLevelClient
 {
@@ -151,6 +160,11 @@ public:
     const google::cloud::Options & getOptions() const { return options; }
     google::cloud::storage::Client & getStorageClient() { return client; }
     const google::cloud::storage::Client & getStorageClient() const { return client; }
+
+    HighLevelReadResult readObject(
+        const std::string & bucket, const std::string & object, size_t offset, std::optional<size_t> limit);
+    void recordReadObjectFailure(const Status & status) const;
+
 
 private:
     ClientSettings settings;
