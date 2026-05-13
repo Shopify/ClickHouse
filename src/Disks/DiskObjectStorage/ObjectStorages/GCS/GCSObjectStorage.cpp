@@ -77,13 +77,6 @@ static String normalizeKeyPrefix(String key_prefix)
 namespace
 {
 
-String bucketResourceName(const String & bucket)
-{
-    if (bucket.starts_with("projects/"))
-        return bucket;
-    return fmt::format("projects/_/buckets/{}", bucket);
-}
-
 const String & objectName(const String & path)
 {
     if (path.starts_with('/'))
@@ -91,26 +84,33 @@ const String & objectName(const String & path)
     return path;
 }
 
-Poco::Timestamp timestampFromProto(const google::protobuf::Timestamp & timestamp)
-{
-    return Poco::Timestamp(
-        static_cast<Poco::Timestamp::TimeVal>(timestamp.seconds()) * 1000000
-        + static_cast<Poco::Timestamp::TimeVal>(timestamp.nanos() / 1000));
-}
-
-ObjectMetadata metadataFromProto(const google::storage::v2::Object & object, bool with_tags)
+ObjectMetadata metadataFromCloud(const google::cloud::storage::ObjectMetadata & object, bool with_tags)
 {
     ObjectMetadata metadata;
-    metadata.size_bytes = object.size() >= 0 ? static_cast<uint64_t>(object.size()) : 0;
+    metadata.size_bytes = object.size();
     metadata.is_size_known = true;
-    if (object.has_update_time())
-        metadata.last_modified = timestampFromProto(object.update_time());
+    const auto updated = object.updated();
+    if (updated != std::chrono::system_clock::time_point{})
+    {
+        const auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(updated.time_since_epoch()).count();
+        metadata.last_modified = Poco::Timestamp(static_cast<Poco::Timestamp::TimeVal>(microseconds));
+    }
     metadata.etag = object.etag();
     for (const auto & [key, value] : object.metadata())
         metadata.attributes.emplace(key, value);
     if (with_tags)
         metadata.tags = {};
     return metadata;
+}
+
+std::map<std::string, std::string> attributesToMap(const std::optional<ObjectAttributes> & attributes)
+{
+    std::map<std::string, std::string> result;
+    if (!attributes)
+        return result;
+    for (const auto & [key, value] : *attributes)
+        result.emplace(key, value);
+    return result;
 }
 
 void validateNativeGCSWriteSettings(const WriteSettings & write_settings)
@@ -122,15 +122,6 @@ void validateNativeGCSWriteSettings(const WriteSettings & write_settings)
             ErrorCodes::BAD_ARGUMENTS,
             "Native GCS object storage supports only '*' for object_storage_write_if_none_match, got '{}'",
             write_settings.object_storage_write_if_none_match);
-}
-
-void applyObjectAttributes(google::storage::v2::Object & resource, const std::optional<ObjectAttributes> & attributes)
-{
-    if (!attributes)
-        return;
-
-    for (const auto & [key, value] : *attributes)
-        (*resource.mutable_metadata())[key] = value;
 }
 
 String statusLogMessage(const GCS::Status & status)
@@ -624,7 +615,7 @@ class GCSWriteBuffer final : public WriteBufferFromFileBase
 {
 public:
     GCSWriteBuffer(
-        std::shared_ptr<GCS::Client> client_,
+        std::shared_ptr<GCS::HighLevelClient> high_level_client_,
         String bucket_,
         String object_name_,
         std::optional<ObjectAttributes> attributes_,
@@ -634,7 +625,7 @@ public:
         ThrottlerPtr remote_throttler_,
         BlobStorageLogWriterPtr blob_storage_log_)
         : WriteBufferFromFileBase(buf_size, nullptr, 0)
-        , client(std::move(client_))
+        , high_level_client(std::move(high_level_client_))
         , bucket(std::move(bucket_))
         , object_name(std::move(object_name_))
         , attributes(std::move(attributes_))
@@ -679,6 +670,8 @@ public:
         try
         {
             next();
+            if (parallel_mode)
+                flushParallelStagedData(/* force */ false);
             explicit_sync_flush = false;
         }
         catch (...)
@@ -689,9 +682,6 @@ public:
     }
 
 private:
-    using WriteObjectStream = grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>;
-    using WriteObjectStreamResult = GCS::StreamResult<WriteObjectStream>;
-
     static constexpr size_t max_write_chunk_bytes = google::storage::v2::ServiceConstants::MAX_WRITE_CHUNK_BYTES;
     static constexpr size_t max_compose_sources = 32;
     static constexpr size_t max_concurrent_uploads = 4;
@@ -708,15 +698,8 @@ private:
         if (!size)
             return;
 
-        if (useSingleStreamForCurrentFlush())
-        {
-            flushStagedDataToSingleStream(/* finish */ false);
-            sendSingleStreamChunks(working_buffer.begin(), size, /* finish */ false);
-            return;
-        }
-
         staged_data.append(working_buffer.begin(), size);
-        if (!parallel_mode && staged_data.size() <= parallel_write_threshold)
+        if (!allow_parallel_upload || (!parallel_mode && staged_data.size() <= parallel_write_threshold))
             return;
 
         startParallelMode();
@@ -727,17 +710,19 @@ private:
     {
         try
         {
-            if (stream_result || (!parallel_mode && staged_data.size() + offset() <= parallel_write_threshold))
+            if (offset())
+                staged_data.append(working_buffer.begin(), offset());
+
+            if (!parallel_mode && (!allow_parallel_upload || staged_data.size() <= parallel_write_threshold))
             {
-                flushStagedDataToSingleStream(/* finish */ false);
-                sendSingleStreamChunks(working_buffer.begin(), offset(), /* finish */ true);
-                finishSingleStream();
+                writeObjectPayload(object_name, staged_data, attributesToMap(attributes), ifGenerationMatchZero(), /* record_failure */ true);
+                staged_data.clear();
+                recordUploadElapsed();
+                addUploadBlobLogEvent(0, {});
                 upload_finalized = true;
                 return;
             }
 
-            if (offset())
-                staged_data.append(working_buffer.begin(), offset());
             startParallelMode();
             flushParallelStagedData(/* force */ true);
 
@@ -765,11 +750,6 @@ private:
         }
     }
 
-    bool useSingleStreamForCurrentFlush() const
-    {
-        return stream_result.has_value() || !allow_parallel_upload || (explicit_sync_flush && !parallel_mode);
-    }
-
     void startParallelMode()
     {
         parallel_mode = true;
@@ -786,106 +766,9 @@ private:
         }
     }
 
-    void flushStagedDataToSingleStream(bool finish)
+    bool ifGenerationMatchZero() const
     {
-        if (staged_data.empty())
-            return;
-
-        sendSingleStreamChunks(staged_data.data(), staged_data.size(), finish);
-        staged_data.clear();
-    }
-
-    void ensureSingleStream()
-    {
-        if (stream_result)
-            return;
-
-        response.emplace();
-        stream_result.emplace(client->writeObject(*response, bucketResourceName(bucket)));
-        if (!stream_result->status.ok())
-        {
-            recordUploadFailure(GCS::errorCodeForStatus(stream_result->status.code), statusLogMessage(stream_result->status));
-            GCS::throwIfError(stream_result->status, "starting WriteObject");
-        }
-    }
-
-    void applyAttributes(google::storage::v2::Object & resource) const
-    {
-        applyObjectAttributes(resource, attributes);
-    }
-
-    void applyWritePreconditions(google::storage::v2::WriteObjectSpec & spec) const
-    {
-        if (object_storage_write_if_none_match == "*")
-            spec.set_if_generation_match(0);
-    }
-
-    void applyComposePreconditions(google::storage::v2::ComposeObjectRequest & request) const
-    {
-        if (object_storage_write_if_none_match == "*")
-            request.set_if_generation_match(0);
-    }
-
-    void fillWriteObjectSpec(google::storage::v2::WriteObjectSpec & spec, const String & target_object, bool include_attributes) const
-    {
-        auto & resource = *spec.mutable_resource();
-        resource.set_bucket(bucketResourceName(bucket));
-        resource.set_name(target_object);
-        if (include_attributes)
-        {
-            applyAttributes(resource);
-            applyWritePreconditions(spec);
-        }
-    }
-
-    void sendSingleStreamChunks(const char * source, size_t size, bool finish)
-    {
-        ensureSingleStream();
-
-        CurrentThread::WriteThrottlingScope write_throttling_scope(remote_throttler);
-
-        size_t sent = 0;
-        while (sent < size || (finish && sent == 0))
-        {
-            const size_t chunk_size = sent < size ? std::min(max_write_chunk_bytes, size - sent) : 0;
-            const bool last_chunk = finish && sent + chunk_size >= size;
-
-            google::storage::v2::WriteObjectRequest request;
-            if (!single_stream_started)
-            {
-                fillWriteObjectSpec(*request.mutable_write_object_spec(), object_name, /* include_attributes */ true);
-                single_stream_started = true;
-            }
-
-            request.set_write_offset(single_stream_write_offset);
-            request.set_finish_write(last_chunk);
-            if (chunk_size)
-                request.mutable_checksummed_data()->set_content(std::string_view(source + sent, chunk_size));
-
-            if (!stream_result->stream->Write(request, grpc::WriteOptions{}))
-                throwWriteFailure("sending", object_name, single_stream_write_offset, *stream_result, /* record_failure */ true);
-
-            accountAcceptedPayload(chunk_size);
-            single_stream_write_offset += chunk_size;
-            sent += chunk_size;
-
-            if (chunk_size == 0)
-                break;
-        }
-    }
-
-    void finishSingleStream()
-    {
-        if (single_stream_finished)
-            return;
-
-        if (!stream_result)
-            sendSingleStreamChunks(nullptr, 0, /* finish */ true);
-
-        finishWriteStream(object_name, single_stream_write_offset, *stream_result, /* record_failure */ true);
-        single_stream_finished = true;
-        recordUploadElapsed();
-        addUploadBlobLogEvent(0, {});
+        return object_storage_write_if_none_match == "*";
     }
 
     String makeTemporaryObjectName(std::string_view kind, size_t index) const
@@ -901,13 +784,12 @@ private:
         const auto part_number = next_part_number++;
         String temporary_object = makeTemporaryObjectName("part", part_number);
         temporary_sources.push_back(temporary_object);
-        accepted_payload_bytes += payload.size();
 
         upload_futures.push_back(std::async(
             std::launch::async,
             [this, temporary_object, upload_payload = std::move(payload)]
             {
-                writeObjectPayload(temporary_object, upload_payload, /* include_attributes */ false, /* record_failure */ false);
+                writeObjectPayload(temporary_object, upload_payload, {}, /* if_generation_match_zero */ true, /* record_failure */ false);
                 markTemporaryObjectCreated(temporary_object);
             }));
     }
@@ -949,8 +831,7 @@ private:
     {
         if (temporary_sources.empty())
         {
-            sendSingleStreamChunks(nullptr, 0, /* finish */ true);
-            finishSingleStream();
+            writeObjectPayload(object_name, {}, attributesToMap(attributes), ifGenerationMatchZero(), /* record_failure */ true);
             return;
         }
 
@@ -981,23 +862,18 @@ private:
 
     void composeObjectsOnce(const std::vector<String> & sources, const String & destination, bool final_object)
     {
-        google::storage::v2::ComposeObjectRequest request;
-        auto & resource = *request.mutable_destination();
-        resource.set_bucket(bucketResourceName(bucket));
-        resource.set_name(destination);
-        if (final_object)
+        auto result = high_level_client->composeObject(
+            bucket,
+            sources,
+            destination,
+            final_object ? attributesToMap(attributes) : std::map<std::string, std::string>{},
+            final_object ? ifGenerationMatchZero() : true);
+        if (!result.status.ok())
         {
-            applyAttributes(resource);
-            applyComposePreconditions(request);
+            if (final_object)
+                recordUploadFailure(GCS::errorCodeForStatus(result.status.code), statusLogMessage(result.status));
+            GCS::throwIfError(result.status, "ComposeObject");
         }
-        else
-            request.set_if_generation_match(0);
-
-        for (const auto & source : sources)
-            request.add_source_objects()->set_name(source);
-
-        auto result = client->composeObject(request);
-        GCS::throwIfError(result.status, "ComposeObject");
     }
 
     void cleanupTemporaryObjects()
@@ -1010,112 +886,29 @@ private:
 
         for (auto it = objects_to_delete.rbegin(); it != objects_to_delete.rend(); ++it)
         {
-            google::storage::v2::DeleteObjectRequest request;
-            request.set_bucket(bucketResourceName(bucket));
-            request.set_object(*it);
-            auto status = client->deleteObject(request);
+            auto status = high_level_client->deleteObject(bucket, *it);
             if (status.code == GCS::StatusCode::NotFound)
                 continue;
             GCS::throwIfError(status, "DeleteObject temporary parallel GCS write object");
         }
     }
 
-    void writeObjectPayload(const String & target_object, const String & payload, bool include_attributes, bool record_failure)
-    {
-        google::storage::v2::WriteObjectResponse write_response;
-        auto write_stream = client->writeObject(write_response, bucketResourceName(bucket));
-        if (!write_stream.status.ok())
-        {
-            if (record_failure)
-                recordUploadFailure(GCS::errorCodeForStatus(write_stream.status.code), statusLogMessage(write_stream.status));
-            GCS::throwIfError(write_stream.status, "starting WriteObject");
-        }
-
-        size_t sent = 0;
-        bool started = false;
-        while (sent < payload.size() || (payload.empty() && sent == 0))
-        {
-            const size_t chunk_size = sent < payload.size() ? std::min(max_write_chunk_bytes, payload.size() - sent) : 0;
-            const bool last_chunk = sent + chunk_size >= payload.size();
-
-            google::storage::v2::WriteObjectRequest request;
-            if (!started)
-            {
-                auto & spec = *request.mutable_write_object_spec();
-                fillWriteObjectSpec(spec, target_object, include_attributes);
-                if (!include_attributes)
-                    spec.set_if_generation_match(0);
-                started = true;
-            }
-            request.set_write_offset(static_cast<int64_t>(sent));
-            request.set_finish_write(last_chunk);
-            if (chunk_size)
-                request.mutable_checksummed_data()->set_content(std::string_view(payload.data() + sent, chunk_size));
-
-            if (!write_stream.stream->Write(request, grpc::WriteOptions{}))
-                throwWriteFailure("sending", target_object, static_cast<int64_t>(sent), write_stream, record_failure);
-
-            if (chunk_size)
-            {
-                if (remote_throttler)
-                    remote_throttler->throttle(chunk_size);
-                ProfileEvents::increment(ProfileEvents::WriteBufferFromGCSBytes, chunk_size);
-            }
-            sent += chunk_size;
-
-            if (chunk_size == 0)
-                break;
-        }
-
-        finishWriteStream(target_object, static_cast<int64_t>(payload.size()), write_stream, record_failure);
-    }
-
-    void finishWriteStream(const String & target_object, int64_t target_offset, WriteObjectStreamResult & write_stream, bool record_failure)
-    {
-        if (!write_stream.stream->WritesDone())
-            throwWriteFailure("finishing writes for", target_object, target_offset, write_stream, record_failure);
-
-        auto finish_status = GCS::fromGrpcStatus(write_stream.stream->Finish());
-        if (!finish_status.ok())
-        {
-            if (record_failure)
-                recordUploadFailure(GCS::errorCodeForStatus(finish_status.code), statusLogMessage(finish_status));
-            GCS::throwIfError(finish_status, "WriteObject");
-        }
-    }
-
-    [[noreturn]] void throwWriteFailure(
-        std::string_view action,
+    void writeObjectPayload(
         const String & target_object,
-        int64_t target_offset,
-        WriteObjectStreamResult & write_stream,
+        const String & payload,
+        const std::map<std::string, std::string> & metadata,
+        bool if_generation_match_zero,
         bool record_failure)
     {
-        auto status = GCS::fromGrpcStatus(write_stream.stream->Finish());
-        if (!status.ok())
+        auto result = high_level_client->insertObject(bucket, target_object, payload, metadata, if_generation_match_zero);
+        if (!result.status.ok())
         {
-            auto error_message = statusLogMessage(status);
             if (record_failure)
-                recordUploadFailure(GCS::errorCodeForStatus(status.code), error_message);
-            throw Exception(
-                GCS::errorCodeForStatus(status.code),
-                "GCS gRPC WriteObject failed while {} object '{}' at offset {} with {}: {}",
-                action,
-                target_object,
-                target_offset,
-                GCS::statusCodeName(status.code),
-                status.message);
+                recordUploadFailure(GCS::errorCodeForStatus(result.status.code), statusLogMessage(result.status));
+            GCS::throwIfError(result.status, "InsertObject");
         }
 
-        auto error_message = fmt::format("stream closed while {} object '{}'", action, target_object);
-        if (record_failure)
-            recordUploadFailure(ErrorCodes::S3_ERROR, error_message);
-        throw Exception(
-            ErrorCodes::S3_ERROR,
-            "GCS gRPC WriteObject stream closed while {} object '{}' at offset {} without a final gRPC error status",
-            action,
-            target_object,
-            target_offset);
+        accountAcceptedPayload(payload.size());
     }
 
     void accountAcceptedPayload(size_t chunk_size)
@@ -1125,7 +918,9 @@ private:
 
         if (remote_throttler)
             remote_throttler->throttle(chunk_size);
+
         ProfileEvents::increment(ProfileEvents::WriteBufferFromGCSBytes, chunk_size);
+        std::lock_guard lock(accepted_payload_mutex);
         accepted_payload_bytes += chunk_size;
     }
 
@@ -1166,7 +961,7 @@ private:
         addUploadBlobLogEvent(error_code, error_message);
     }
 
-    std::shared_ptr<GCS::Client> client;
+    std::shared_ptr<GCS::HighLevelClient> high_level_client;
     String bucket;
     String object_name;
     std::optional<ObjectAttributes> attributes;
@@ -1177,22 +972,18 @@ private:
     ThrottlerPtr remote_throttler;
     BlobStorageLogWriterPtr blob_storage_log;
     Stopwatch upload_watch;
-    std::optional<google::storage::v2::WriteObjectResponse> response;
-    std::optional<WriteObjectStreamResult> stream_result;
     std::vector<std::future<void>> upload_futures;
     std::vector<String> temporary_sources;
     std::vector<String> temporary_objects;
     std::mutex temporary_objects_mutex;
+    std::mutex accepted_payload_mutex;
     String staged_data;
     bool explicit_sync_flush = false;
     bool parallel_mode = false;
-    bool single_stream_started = false;
-    bool single_stream_finished = false;
     bool upload_finalized = false;
     bool upload_elapsed_recorded = false;
     bool upload_blob_log_written = false;
     bool upload_failure_recorded = false;
-    int64_t single_stream_write_offset = 0;
     size_t next_part_number = 0;
     size_t next_compose_number = 0;
     size_t accepted_payload_bytes = 0;
@@ -1203,10 +994,8 @@ private:
 
 
 #if USE_GOOGLE_CLOUD
-GCSObjectStorage::GCSObjectStorage(
-    GCSObjectStorageSettings settings_, std::shared_ptr<GCS::Client> client_, std::shared_ptr<GCS::HighLevelClient> high_level_client_)
+GCSObjectStorage::GCSObjectStorage(GCSObjectStorageSettings settings_, std::shared_ptr<GCS::HighLevelClient> high_level_client_)
     : settings(std::move(settings_))
-    , client(std::move(client_))
     , high_level_client(std::move(high_level_client_))
 {
 }
@@ -1280,7 +1069,7 @@ std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
         blob_storage_log->local_path = object.local_path;
 
     return std::make_unique<GCSWriteBuffer>(
-        client,
+        high_level_client,
         settings.bucket,
         objectName(object.remote_path),
         std::move(attributes),
@@ -1308,12 +1097,8 @@ void GCSObjectStorage::removeObjectIfExists(const StoredObject & object)
 void GCSObjectStorage::removeObjectIfExistsImpl(const StoredObject & object, const BlobStorageLogWriterPtr & blob_storage_log) const
 {
 #if USE_GOOGLE_CLOUD
-    google::storage::v2::DeleteObjectRequest request;
-    request.set_bucket(bucketResourceName(settings.bucket));
-    request.set_object(objectName(object.remote_path));
-
     Stopwatch watch;
-    auto status = client->deleteObject(request);
+    auto status = high_level_client->deleteObject(settings.bucket, objectName(object.remote_path));
     if (blob_storage_log)
         blob_storage_log->addEvent(
             BlobStorageLogElement::EventType::Delete,
@@ -1366,30 +1151,14 @@ void GCSObjectStorage::rewriteObjectFromGCS(
 
     validateNativeGCSWriteSettings(write_settings);
 
-    google::storage::v2::RewriteObjectRequest request;
-    request.set_source_bucket(bucketResourceName(source_storage.settings.bucket));
-    request.set_source_object(objectName(object_from.remote_path));
-    request.set_destination_bucket(bucketResourceName(settings.bucket));
-    request.set_destination_name(objectName(object_to.remote_path));
-    if (object_to_attributes)
-        applyObjectAttributes(*request.mutable_destination(), object_to_attributes);
-    if (write_settings.object_storage_write_if_none_match == "*")
-        request.set_if_generation_match(0);
-
-    while (true)
-    {
-        auto result = client->rewriteObject(request);
-        GCS::throwIfError(result.status, "RewriteObject");
-        if (result.response.done())
-            return;
-        if (result.response.rewrite_token().empty())
-            throw Exception(
-                ErrorCodes::S3_ERROR,
-                "GCS gRPC RewriteObject from '{}' to '{}' returned an incomplete response without rewrite token",
-                object_from.remote_path,
-                object_to.remote_path);
-        request.set_rewrite_token(result.response.rewrite_token());
-    }
+    auto result = high_level_client->rewriteObject(
+        source_storage.settings.bucket,
+        objectName(object_from.remote_path),
+        settings.bucket,
+        objectName(object_to.remote_path),
+        attributesToMap(object_to_attributes),
+        write_settings.object_storage_write_if_none_match == "*");
+    GCS::throwIfError(result.status, "RewriteObject");
 }
 #endif
 
@@ -1453,15 +1222,11 @@ ObjectMetadata GCSObjectStorage::getObjectMetadata(const std::string & path, boo
 std::optional<ObjectMetadata> GCSObjectStorage::tryGetObjectMetadata(const std::string & path, bool with_tags) const
 {
 #if USE_GOOGLE_CLOUD
-    google::storage::v2::GetObjectRequest request;
-    request.set_bucket(bucketResourceName(settings.bucket));
-    request.set_object(objectName(path));
-
-    auto result = client->getObject(request);
+    auto result = high_level_client->getObjectMetadata(settings.bucket, objectName(path));
     if (result.status.code == GCS::StatusCode::NotFound)
         return std::nullopt;
-    GCS::throwIfError(result.status, "GetObject");
-    return metadataFromProto(result.response, with_tags);
+    GCS::throwIfError(result.status, "GetObjectMetadata");
+    return metadataFromCloud(result.response, with_tags);
 #else
     (void)path;
     (void)with_tags;
@@ -1473,26 +1238,15 @@ void GCSObjectStorage::listObjects(const std::string & path, RelativePathsWithMe
 {
 #if USE_GOOGLE_CLOUD
     const size_t target_keys = max_keys;
-    google::storage::v2::ListObjectsRequest request;
-    request.set_parent(bucketResourceName(settings.bucket));
-    request.set_prefix(objectName(path));
-    request.set_page_size(max_keys ? static_cast<int32_t>(max_keys) : 1000);
+    auto result = high_level_client->listObjects(settings.bucket, objectName(path), max_keys, std::nullopt);
+    GCS::throwIfError(result.status, "ListObjects");
 
-    do
+    for (const auto & object : result.response)
     {
-        auto result = client->listObjects(request);
-        GCS::throwIfError(result.status, "ListObjects");
-
-        for (const auto & object : result.response.objects())
-        {
-            children.emplace_back(
-                std::make_shared<RelativePathWithMetadata>(object.name(), metadataFromProto(object, /* with_tags */ false)));
-            if (target_keys && children.size() >= target_keys)
-                return;
-        }
-
-        request.set_page_token(result.response.next_page_token());
-    } while (!request.page_token().empty());
+        children.emplace_back(std::make_shared<RelativePathWithMetadata>(object.name(), metadataFromCloud(object, /* with_tags */ false)));
+        if (target_keys && children.size() >= target_keys)
+            return;
+    }
 #else
     (void)path;
     (void)children;
@@ -1506,33 +1260,19 @@ ObjectStorageIteratorPtr GCSObjectStorage::iterate(
 {
 #if USE_GOOGLE_CLOUD
     RelativePathsWithMetadata files;
-    google::storage::v2::ListObjectsRequest request;
-    request.set_parent(bucketResourceName(settings.bucket));
-    request.set_prefix(objectName(path_prefix));
-    if (max_keys)
-        request.set_page_size(static_cast<int32_t>(max_keys));
-    else
-        request.set_page_size(1000);
-    if (start_after && !start_after->empty())
-        request.set_lexicographic_start(*start_after);
+    const size_t fetch_max_keys = start_after && !start_after->empty() && max_keys ? max_keys + 1 : max_keys;
+    auto result = high_level_client->listObjects(settings.bucket, objectName(path_prefix), fetch_max_keys, start_after);
+    GCS::throwIfError(result.status, "ListObjects");
 
-    do
+    for (const auto & object : result.response)
     {
-        auto result = client->listObjects(request);
-        GCS::throwIfError(result.status, "ListObjects");
+        if (start_after && !start_after->empty() && object.name() <= *start_after)
+            continue;
 
-        for (const auto & object : result.response.objects())
-        {
-            if (start_after && !start_after->empty() && object.name() <= *start_after)
-                continue;
-
-            files.emplace_back(std::make_shared<RelativePathWithMetadata>(object.name(), metadataFromProto(object, with_tags)));
-            if (max_keys && files.size() >= max_keys)
-                return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
-        }
-
-        request.set_page_token(result.response.next_page_token());
-    } while (!request.page_token().empty());
+        files.emplace_back(std::make_shared<RelativePathWithMetadata>(object.name(), metadataFromCloud(object, with_tags)));
+        if (max_keys && files.size() >= max_keys)
+            return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
+    }
 
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
 #else
@@ -1638,9 +1378,8 @@ ObjectStoragePtr createGCSObjectStorage(
     GCS::assertGrpcAvailable();
 
 #if USE_GOOGLE_CLOUD
-    auto client = GCS::createClient(settings.client_settings);
     auto high_level_client = GCS::createHighLevelClient(settings.client_settings);
-    return std::make_shared<GCSObjectStorage>(std::move(settings), std::move(client), std::move(high_level_client));
+    return std::make_shared<GCSObjectStorage>(std::move(settings), std::move(high_level_client));
 #else
     throw Exception(
         ErrorCodes::NOT_IMPLEMENTED,

@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #if USE_GOOGLE_CLOUD
@@ -163,8 +164,31 @@ public:
 
     HighLevelReadResult readObject(
         const std::string & bucket, const std::string & object, size_t offset, std::optional<size_t> limit);
+    Result<google::cloud::storage::ObjectMetadata> insertObject(
+        const std::string & bucket,
+        const std::string & object,
+        std::string_view payload,
+        const std::map<std::string, std::string> & metadata,
+        bool if_generation_match_zero);
+    Result<google::cloud::storage::ObjectMetadata> composeObject(
+        const std::string & bucket,
+        const std::vector<std::string> & sources,
+        const std::string & destination,
+        const std::map<std::string, std::string> & metadata,
+        bool if_generation_match_zero);
+    Result<google::cloud::storage::ObjectMetadata> rewriteObject(
+        const std::string & source_bucket,
+        const std::string & source_object,
+        const std::string & destination_bucket,
+        const std::string & destination_object,
+        const std::map<std::string, std::string> & metadata,
+        bool if_generation_match_zero);
+    Result<google::cloud::storage::ObjectMetadata> getObjectMetadata(const std::string & bucket, const std::string & object);
+    Result<std::vector<google::cloud::storage::ObjectMetadata>> listObjects(
+        const std::string & bucket, const std::string & prefix, size_t max_keys, const std::optional<std::string> & start_after);
+    Status deleteObject(const std::string & bucket, const std::string & object);
     void recordReadObjectFailure(const Status & status) const;
-
+    void recordWriteObjectFailure(const Status & status) const;
 
 private:
     ClientSettings settings;
