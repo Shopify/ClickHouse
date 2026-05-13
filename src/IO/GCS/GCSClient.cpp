@@ -524,6 +524,74 @@ private:
     std::unique_ptr<google::storage::v2::Storage::StubInterface> stub;
 };
 
+class RoundRobinStub final : public IStub
+{
+public:
+    explicit RoundRobinStub(std::vector<std::shared_ptr<IStub>> children_)
+        : children(std::move(children_))
+    {
+    }
+
+    grpc::Status getObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::GetObjectRequest & request,
+        google::storage::v2::Object & response) override
+    {
+        return child().getObject(context, request, response);
+    }
+
+    grpc::Status listObjects(
+        grpc::ClientContext & context,
+        const google::storage::v2::ListObjectsRequest & request,
+        google::storage::v2::ListObjectsResponse & response) override
+    {
+        return child().listObjects(context, request, response);
+    }
+
+    grpc::Status composeObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::ComposeObjectRequest & request,
+        google::storage::v2::Object & response) override
+    {
+        return child().composeObject(context, request, response);
+    }
+
+    grpc::Status rewriteObject(
+        grpc::ClientContext & context,
+        const google::storage::v2::RewriteObjectRequest & request,
+        google::storage::v2::RewriteResponse & response) override
+    {
+        return child().rewriteObject(context, request, response);
+    }
+
+    grpc::Status deleteObject(
+        grpc::ClientContext & context, const google::storage::v2::DeleteObjectRequest & request, google::protobuf::Empty & response) override
+    {
+        return child().deleteObject(context, request, response);
+    }
+
+    std::unique_ptr<grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>>
+    readObject(grpc::ClientContext & context, const google::storage::v2::ReadObjectRequest & request) override
+    {
+        return child().readObject(context, request);
+    }
+
+    std::unique_ptr<grpc::ClientWriterInterface<google::storage::v2::WriteObjectRequest>>
+    writeObject(grpc::ClientContext & context, google::storage::v2::WriteObjectResponse & response) override
+    {
+        return child().writeObject(context, response);
+    }
+
+private:
+    IStub & child() const
+    {
+        return *children[next.fetch_add(1, std::memory_order_relaxed) % children.size()];
+    }
+
+    std::vector<std::shared_ptr<IStub>> children;
+    mutable std::atomic_size_t next{0};
+};
+
 std::shared_ptr<google::cloud::Credentials> makeCredentials(const ClientSettings & settings)
 {
     switch (credentialMode(settings))
@@ -734,11 +802,21 @@ std::shared_ptr<Client> createClient(const ClientSettings & settings)
 {
     assertGrpcAvailable();
 
-    grpc::ChannelArguments channel_arguments;
     google::cloud::CompletionQueue completion_queue;
     auto auth = google::cloud::internal::CreateAuthenticationStrategy(*makeCredentials(settings), completion_queue);
-    auto channel = auth->CreateChannel(settings.endpoint, channel_arguments);
-    auto stub = std::make_shared<GeneratedStub>(google::storage::v2::Storage::NewStub(channel));
+
+    constexpr UInt64 channel_count = 16;
+    std::vector<std::shared_ptr<IStub>> stubs;
+    stubs.reserve(channel_count);
+    for (UInt64 i = 0; i != channel_count; ++i)
+    {
+        grpc::ChannelArguments channel_arguments;
+        channel_arguments.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+        channel_arguments.SetInt(GRPC_ARG_CHANNEL_ID, static_cast<int>(i));
+        auto channel = auth->CreateChannel(settings.endpoint, channel_arguments);
+        stubs.push_back(std::make_shared<GeneratedStub>(google::storage::v2::Storage::NewStub(channel)));
+    }
+    std::shared_ptr<IStub> stub = std::make_shared<RoundRobinStub>(std::move(stubs));
     return std::make_shared<Client>(settings, std::move(stub), std::move(auth));
 }
 

@@ -223,6 +223,26 @@ public:
     std::optional<size_t> getRemoteFileSize() const override { return file_size; }
     size_t getFileOffsetOfBufferEnd() const override { return read_offset; }
 
+    void setReadUntilPosition(size_t position) override
+    {
+        if (read_until_position && *read_until_position == position)
+            return;
+
+        resetSequentialStream();
+        read_until_position = position;
+        sequential_eof = read_offset >= position;
+    }
+
+    void setReadUntilEnd() override
+    {
+        if (!read_until_position)
+            return;
+
+        resetSequentialStream();
+        read_until_position.reset();
+        sequential_eof = false;
+    }
+
 private:
     using ReadObjectStream = grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>;
 
@@ -307,18 +327,30 @@ private:
 
     std::optional<size_t> sequentialReadLimit(size_t offset) const
     {
+        std::optional<size_t> limit;
         if (file_size)
-            return std::min(*file_size - offset, sequentialWindowSizeForKnownFile());
+            limit = std::min(*file_size - offset, sequentialWindowSizeForKnownFile());
+        else
+        {
+            size_t estimated_limit = 0;
+            if (read_hint)
+                estimated_limit = std::max(estimated_limit, *read_hint);
+            if (remote_fs_prefetch)
+                estimated_limit = std::max(estimated_limit, prefetch_buffer_size);
+            if (estimated_limit > internal_buffer.size())
+                limit = estimated_limit;
+        }
 
-        size_t limit = 0;
-        if (read_hint)
-            limit = std::max(limit, *read_hint);
-        if (remote_fs_prefetch)
-            limit = std::max(limit, prefetch_buffer_size);
+        if (read_until_position)
+        {
+            if (offset >= *read_until_position)
+                return 0;
+            const size_t bounded_limit = *read_until_position - offset;
+            if (!limit || *limit > bounded_limit)
+                limit = bounded_limit;
+        }
 
-        if (limit > internal_buffer.size())
-            return limit;
-        return {};
+        return limit;
     }
 
     size_t sequentialWindowSizeForKnownFile() const
@@ -335,7 +367,7 @@ private:
         if (sequential_stream || sequential_eof)
             return;
 
-        if (file_size && offset >= *file_size)
+        if ((file_size && offset >= *file_size) || (read_until_position && offset >= *read_until_position))
         {
             sequential_eof = true;
             return;
@@ -577,6 +609,7 @@ private:
     String bucket;
     String object_name;
     std::optional<size_t> read_hint;
+    std::optional<size_t> read_until_position;
     bool remote_fs_prefetch;
     size_t prefetch_buffer_size;
     ThrottlerPtr remote_throttler;
