@@ -6,7 +6,7 @@ Plan slug: gcs-grpc-s3-perf-parity
 
 ## User goal
 
-Investigate differences between the existing GCS-as-`s3` implementation path and the native GCS gRPC implementation, inspect the GCS gRPC library and usage patterns, verify whether ClickHouse uses the library correctly, and determine why overall read queries are slower with native gRPC than with the S3-compatible GCS path.
+Investigate differences between the existing GCS-as-`s3` implementation path and the native GCS gRPC implementation, inspect the GCS gRPC library and usage patterns, verify whether ClickHouse uses the library correctly, and determine why overall read and write workloads are slower or behave differently with native gRPC than with the S3-compatible GCS path.
 
 ## Investigation baseline
 
@@ -49,14 +49,14 @@ Planning response:
 
 ## Problem statement
 
-Native GCS gRPC read queries are slower than the GCS-as-`s3` baseline because ClickHouse's native path currently differs in gRPC client/channel policy, right-bounded read handling, remote filesystem buffer integration, cancellation accounting, retry behavior, and protobuf/Cord copy overhead. The plan must turn the investigation into a controlled sequence that proves the baseline, chooses the correct client architecture, implements the known correctness/performance fixes, and verifies elapsed-time parity without breaking the existing S3-compatible GCS path.
+Native GCS gRPC read and write workloads differ from the GCS-as-`s3` baseline because ClickHouse's native path currently differs in gRPC client/channel policy, right-bounded read handling, remote filesystem buffer integration, write/upload request behavior, cancellation accounting, retry behavior, and protobuf/Cord copy overhead. The plan must turn the investigation into a controlled sequence that proves the baseline, chooses the correct client architecture, implements the known correctness/performance fixes, and verifies read/write parity without breaking the existing S3-compatible GCS path.
 
 ## Non-goals
 
 - Do not replace or remove existing GCS-as-`s3` XML/API compatibility.
 - Do not benchmark AWS S3 as the primary baseline.
 - Do not make the `gcs` table function use native gRPC in this plan.
-- Do not treat write, copy, or backup parity as primary outcomes except where source interfaces constrain read performance work.
+- Do not treat copy or backup parity as primary outcomes except where source interfaces constrain read/write performance work. The staging `/work/gcs-grpc-testing/run_benchmarks.sh` copy results are recorded as important context, but copy does not become primary scope unless the user explicitly changes scope again.
 - Do not hide real gRPC errors by broad status suppression.
 - Do not create a new gRPC channel/client per request.
 - Do not ship a hardcoded final channel count such as `16` without setting, endpoint-aware default, or documented equivalence to upstream behavior.
@@ -66,19 +66,24 @@ Native GCS gRPC read queries are slower than the GCS-as-`s3` baseline because Cl
 - Only this plan file may be created or updated by this prompt.
 - Existing dirty changes in `src/IO/GCS/GCSClient.cpp`, `src/Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.cpp`, `contrib/liburing`, and `contrib/sysroot` must be left untouched unless later phase work explicitly owns them.
 - GCS-as-`s3` XML/API behavior against GCS is the benchmark and compatibility baseline.
-- Elapsed query time is the primary parity metric; CPU, allocations, bytes, request counts, and error counters are secondary diagnostics.
-- The client architecture phase must compare formalizing the custom generated-stub/channel-pool prototype against adopting or closely aligning with `google-cloud-cpp` `storage::MakeGrpcClient` behavior.
-- Native GCS performance results must record endpoint/direct-connectivity status before being used as acceptance evidence.
+- Elapsed workload time for read and write is the primary parity metric; CPU, allocations, bytes, request counts, error counters, and per-run warm-up trends are secondary diagnostics.
+- The client architecture phase must compare formalizing the custom generated-stub/channel-pool prototype against a real, separate-branch test of the higher-level `google-cloud-cpp` `storage::MakeGrpcClient` path.
+- Native GCS performance results must record endpoint/direct-connectivity status before being used as acceptance evidence; for staging, `/work/gcs-grpc-testing/env.sh` was updated to use the `google-c2p://` endpoint and native GCS reads/writes are confirmed working.
 - Expected cleanup cancellation may treat raw `grpc::StatusCode::CANCELLED` as expected; `DeadlineExceeded` remains a real timeout/error signal.
 - Future build and test commands must redirect output to log files in the build directory and use a subagent to summarize logs, per repository instructions.
+- Staging validation should use `kubectl exec -n ch-builder clickhouse-builder-0 -- <command>` against `/work/ch-dev`, which is a copy of this branch. Changes can reach staging by commit/push/pull or by `kubectl cp` of specific files into `/work/ch-dev`.
+- Staging builds should run `ninja` from `/work/ch-dev/build`, with output redirected to a build log.
+- If staging validation needs a server restart, use or create `/work/gcs-grpc-testing/start_server.sh`; it must source `/work/gcs-grpc-testing/env.sh`, kill an already-running `clickhouse-server`, start `/work/ch-dev/build/programs/clickhouse-server` in the background, and use a config with `query_log` enabled.
+- The staging benchmark tables `p06_gcs_20260512T174206Z.native_read` and `p06_gcs_20260512T174206Z.s3_read` already exist with data and are configured for native GCS gRPC and GCS-as-`s3` respectively.
 
 ## Assumptions
 
-- The primary workload remains full or wide `MergeTree` scans over GCS-backed object storage. Confidence: high. Validate in P01 by recording benchmark tables, queries, and settings.
+- The primary workload includes full or wide `MergeTree` scans over GCS-backed object storage and bulk write workloads exercised by `/work/gcs-grpc-testing/run_benchmarks.sh`. Confidence: high. Validate in P01/P06 by recording benchmark tables, queries, settings, and per-run results.
 - The remote benchmark tables from the investigation, `p06_gcs_20260512T174206Z.native_read` and `p06_gcs_20260512T174206Z.s3_read`, remain available or can be recreated equivalently. Confidence: medium. Validate in P01.
 - A default elapsed-time parity target of native median elapsed time no worse than `1.25x` the GCS-as-`s3` median is a useful initial bar, with P01 allowed to record a stricter or looser threshold if the benchmark environment justifies it. Confidence: medium. Validate in P01 and P06.
 - The current multi-channel and bounded-read prototype is evidence-bearing but not production-ready because its channel count and architecture choice are not finalized. Confidence: high. Validate in P02-P04.
-- DirectPath or non-DirectPath endpoint mode materially changes the correct channel-count default. Confidence: high. Validate in P01 and apply in P04.
+- DirectPath is available and working in staging: `/work/gcs-grpc-testing/env.sh` uses the `google-c2p://` endpoint, and native GCS reads/writes work. Confidence: high for staging; future phases should preserve this evidence in review artifacts and apply DirectPath-aware channel policy in P04.
+- Native read and copy timings in `/work/results/20260513T000127Z` speed up across iterations (`read` native `1.78s` to `0.89s`; `copy` native `3.31s` to `2.22s`), so later verification must report per-run sequences and medians rather than only one run. Confidence: high for that benchmark result.
 
 ## Open questions
 
@@ -86,19 +91,25 @@ None. Investigation Q001-Q003 were asked directly and resolved. Remaining uncert
 
 ## Acceptance criteria
 
-- [ ] A001: P01 records a reproducible benchmark/environment contract for native GCS gRPC versus GCS-as-`s3`, including endpoint/direct-connectivity status, benchmark queries, settings, primary elapsed-time target, and secondary metrics.
-- [ ] A002: P02 records an architecture decision comparing the custom generated-stub/channel-pool path against `google-cloud-cpp` `storage::MakeGrpcClient` alignment, including instrumentation, cancellation, settings, and testability tradeoffs.
+- [ ] A001: P01 records a reproducible benchmark/environment contract for native GCS gRPC versus GCS-as-`s3`, including endpoint/direct-connectivity status, benchmark queries, settings, primary elapsed-time target, secondary metrics, and post-P01 read/write/copy staging benchmark context.
+- [ ] A002: P02 records an architecture decision comparing the custom generated-stub/channel-pool path against a separate-branch higher-level `google-cloud-cpp` `storage::MakeGrpcClient` test, including read and write API fit, instrumentation, cancellation, settings, performance evidence, and testability tradeoffs.
 - [ ] A003: P03 validates native GCS right-bounded reads under `remote_filesystem_read_method='threadpool'` and direct read mode so `ReadBufferFromGCSBytes` no longer materially exceeds `ReadCompressedBytes` or the S3-compatible baseline for the target scan.
-- [ ] A004: P04 delivers production-ready native GCS client/channel behavior with persistent clients/channels, fresh per-RPC contexts, endpoint-aware or configurable channel count, and no hardcoded final `16`-channel policy.
+- [ ] A004: P04 delivers production-ready native GCS client/channel and write-path behavior with persistent clients/channels, fresh per-RPC contexts, endpoint-aware or configurable channel count, no hardcoded final `16`-channel policy, and no obvious write serialization bottleneck left unmeasured.
 - [ ] A005: P05 ensures successful native GCS reads do not count expected local cleanup `CANCELLED` statuses as remote read errors, while real `DeadlineExceeded` and other unexpected statuses remain visible.
-- [ ] A006: P06 final benchmark shows native GCS median elapsed time meets the P01 parity threshold against GCS-as-`s3`, or records a measured residual bottleneck with CPU/allocation/bytes evidence and a bounded follow-up recommendation.
+- [ ] A006: P06 final benchmark shows native GCS read and write median elapsed times meet the P01/P06 parity threshold against GCS-as-`s3`, or records measured residual bottlenecks with CPU/allocation/bytes/request evidence and bounded follow-up recommendations.
 - [ ] A007: Across P03-P06, existing GCS-as-`s3` behavior remains unchanged except for benchmark/control observations.
+- [ ] A008: P06 records per-run trends, including native read/copy warm-up behavior and write variance, so parity decisions are based on repeated runs rather than a single lucky or unlucky execution.
 
 ## Relevant context
 
 - `plans/gcs-grpc-s3-perf-parity/investigation.md`: Ready evidence baseline; imports findings F001-F008, resolved user answers, constraints, assumptions, and recommended phase shape.
 - `AGENTS.md`: Repository rules for commits, docs wording, C++ style, build/test logging, and use of `tmp`.
 - `README.md`: General ClickHouse project context; no GCS-specific planning constraints found.
+- Staging DirectPath/direct connectivity: `/work/gcs-grpc-testing/env.sh` was updated to use the `google-c2p://` endpoint, and native GCS reads/writes are confirmed working.
+- Staging test environment: use `kubectl exec -n ch-builder clickhouse-builder-0 -- <command>`; remote source tree is `/work/ch-dev`; remote build directory is `/work/ch-dev/build`; staging file sync can use commit/push/pull or `kubectl cp` for specific files.
+- Staging benchmark run: `/work/gcs-grpc-testing/run_benchmarks.sh` wrote results to `/work/results/20260513T000127Z`; medians from five runs were read native `1.38s` vs S3 `1.18s` (`1.17x`), write native `79.25s` vs S3 `10.80s` (`7.34x` slower), and copy native `2.66s` vs S3 `4.12s` (`0.65x`, native faster). Native read and copy speed up across iterations (`read`: `1.78`, `1.58`, `1.38`, `1.15`, `0.89`; `copy`: `3.31`, `3.18`, `2.66`, `2.51`, `2.22`), so later benchmark reviews must report per-run trends. Read results meet the provisional `1.25x` threshold in that run; write parity is now in scope; copy remains context unless scope changes.
+- Staging server helper: use or create `/work/gcs-grpc-testing/start_server.sh`; it should source `/work/gcs-grpc-testing/env.sh`, kill an existing `clickhouse-server`, start `/work/ch-dev/build/programs/clickhouse-server` in the background, and use a config that enables `query_log`.
+- Staging benchmark tables: `p06_gcs_20260512T174206Z.native_read` uses native GCS gRPC, and `p06_gcs_20260512T174206Z.s3_read` uses GCS-as-`s3`; both already exist with data.
 - `src/IO/GCS/GCSClient.cpp`: Native GCS gRPC client, operation accounting, stream creation, and current dirty round-robin prototype surface.
 - `src/IO/GCS/GCSClient.h`: Native GCS client interface and future settings surface if channel/client behavior needs exposure.
 - `src/IO/GCS/GCSStatus.cpp`: gRPC-to-ClickHouse status mapping and retryability policy.
@@ -152,6 +163,18 @@ None. Investigation Q001-Q003 were asked directly and resolved. Remaining uncert
   Reversible: yes
   Affects phases: P03, P04
 
+- D007: Include native GCS write parity in this plan.
+  Rationale: Staging results show native write median `79.25s` versus S3 `10.80s`, and the user wants write parity included because it may suffer from similar client/channel or request-path issues as reads.
+  Alternatives considered: Track write parity as a separate follow-up plan. Rejected by updated user scope.
+  Reversible: yes
+  Affects phases: P02, P04, P06
+
+- D008: Report per-run trends as well as medians.
+  Rationale: Staging native read and copy executions speed up across iterations, so a median alone can hide warm-up/cache/channel effects that matter for interpretation.
+  Alternatives considered: Median-only benchmark reporting. Rejected as too lossy for this workload.
+  Reversible: yes
+  Affects phases: P01, P06
+
 ## Verification ladder
 
 Use the lowest sufficient verification tier for each phase:
@@ -167,12 +190,12 @@ Each phase names its intended tier and why that tier is sufficient. Because the 
 
 | Phase | Slug | Goal | Dependencies | Expected artifacts | Verification tier | Verification |
 |---|---|---|---|---|---|---|
-| P01 | 01-benchmark-and-environment-contract | Establish reproducible baseline, endpoint mode, metrics, and parity threshold. | none | `tmp/gcs-grpc-s3-perf-parity/p01-*`, phase review | Tier 2 | Controlled native vs GCS-as-`s3` benchmark with profile events and endpoint/direct-connectivity evidence. |
-| P02 | 02-client-architecture-comparison | Choose between formalized custom pooling and `google-cloud-cpp` `storage::MakeGrpcClient` alignment. | P01 | Architecture decision in notes/review; optional throwaway prototype notes | Tier 3 | Manual source/design review grounded in P01 data and vendored library behavior. |
+| P01 | 01-benchmark-and-environment-contract | Establish reproducible baseline, endpoint mode, metrics, parity threshold, and staging read/write/copy context. | none | `tmp/gcs-grpc-s3-perf-parity/p01-*`, phase review | Tier 2 | Controlled native vs GCS-as-`s3` benchmark with profile events and endpoint/direct-connectivity evidence. |
+| P02 | 02-client-architecture-comparison | Choose between formalized custom pooling and separate-branch `google-cloud-cpp` `storage::MakeGrpcClient` testing for read and write paths. | P01 | Architecture decision in notes/review; separate branch evidence for `MakeGrpcClient`; optional throwaway prototype notes | Tier 3 | Manual source/design review grounded in P01 data, staging write evidence, vendored library behavior, and the separate-branch `MakeGrpcClient` test. |
 | P03 | 03-bounded-read-parity | Make native GCS right-bounded reads correct and verifiable. | P01 | `src/Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.cpp`, targeted tests or benchmark evidence, phase review | Tier 2 | Threadpool/direct-read scenario showing no material GCS over-read. |
-| P04 | 04-client-channel-parity | Implement the chosen production-ready client/channel architecture. | P01, P02, P03 | `src/IO/GCS/GCSClient.cpp`, `src/IO/GCS/GCSClient.h` if needed, tests/bench evidence, phase review | Tier 2 | Build plus native vs S3-compatible elapsed benchmark showing channel bottleneck removed. |
+| P04 | 04-client-channel-parity | Implement the chosen production-ready client/channel architecture and address measured write-path bottlenecks. | P01, P02, P03 | `src/IO/GCS/GCSClient.cpp`, `src/IO/GCS/GCSClient.h` if needed, GCS object-storage write-path changes if measured, tests/bench evidence, phase review | Tier 2 | Build plus native vs S3-compatible read/write benchmark showing channel/write bottlenecks addressed. |
 | P05 | 05-cancellation-metrics-parity | Correct expected cancellation accounting and preserve real error visibility. | P03, P04 | `src/IO/GCS/GCSClient.cpp`, `src/Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.cpp` if needed, metrics evidence, phase review | Tier 2 | Successful query cleanup has no expected-cancellation read-error noise; real timeout statuses remain classified. |
-| P06 | 06-residual-performance-closure | Close or explain the remaining elapsed-time gap with CPU/allocation/bytes evidence. | P05 | Final benchmark/profiling report, targeted source changes only if measured, phase review | Tier 2 | Final controlled benchmark against P01 threshold and secondary diagnostics. |
+| P06 | 06-residual-performance-closure | Close or explain remaining read/write elapsed-time gaps with CPU/allocation/bytes/request evidence. | P05 | Final benchmark/profiling report, targeted source changes only if measured, phase review | Tier 2 | Final controlled read/write benchmark against P01/P06 thresholds and secondary diagnostics. |
 
 ## Phases
 
@@ -181,13 +204,14 @@ Each phase names its intended tier and why that tier is sufficient. Because the 
 Slug: `01-benchmark-and-environment-contract`
 
 Goal:
-Establish the reproducible GCS-as-`s3` versus native GCS gRPC benchmark contract, including endpoint/direct-connectivity status, cache/settings controls, query set, tables, primary elapsed-time threshold, and secondary attribution metrics.
+Establish the reproducible GCS-as-`s3` versus native GCS gRPC benchmark contract, including endpoint/direct-connectivity status, cache/settings controls, query set, tables, primary elapsed-time threshold, secondary attribution metrics, and post-P01 read/write/copy staging context.
 
 Scope:
 - Record exact native and GCS-as-`s3` tables or recreate-equivalent criteria.
 - Record server/client settings, especially `remote_filesystem_read_method`, cache state, prefetch behavior, and profile-event collection.
 - Record endpoint and direct-connectivity evidence for the native GCS gRPC path.
 - Establish the elapsed-time parity threshold, defaulting to native median `<= 1.25x` GCS-as-`s3` median unless this phase records a justified adjustment.
+- Preserve post-P01 staging benchmark context from `/work/results/20260513T000127Z`, including read/write medians and native read/copy warm-up trends.
 
 Out of scope:
 - Production source changes.
@@ -207,6 +231,7 @@ Inputs:
 Outputs:
 - Benchmark/environment contract with queries, settings, endpoint/direct-connectivity status, metrics, and threshold.
 - Baseline benchmark logs under repository-local `tmp` or build log directories.
+- Post-P01 staging benchmark summary for read, write, and copy context.
 
 Downstream contract:
 - Later phases may use the P01 query set, settings, and threshold as the authoritative benchmark contract.
@@ -214,7 +239,7 @@ Downstream contract:
 
 Assumptions exported:
 - GCS-as-`s3` XML/API against GCS is the control path.
-- Elapsed time is primary; bytes/request/error/CPU/allocation signals are diagnostics.
+- Elapsed time is primary for read and write; bytes/request/error/CPU/allocation signals and per-run trends are diagnostics.
 
 Assumptions not exported:
 - Any single run is representative; later phases must use repeated medians or P01's recorded method.
@@ -225,7 +250,7 @@ Expected artifacts:
 
 Verification approach:
 - Tier: Tier 2
-- Method: Run the agreed native and GCS-as-`s3` `SELECT * ... FORMAT Null` scenarios with `--print-profile-events --time`, including `remote_filesystem_read_method='threadpool'` and `'read'` where relevant. Record endpoint/direct-connectivity evidence or mark results diagnostic-only.
+- Method: Run the agreed native and GCS-as-`s3` `SELECT * ... FORMAT Null` scenarios with `--print-profile-events --time`, including `remote_filesystem_read_method='threadpool'` and `'read'` where relevant. Record endpoint/direct-connectivity evidence or mark results diagnostic-only. Preserve later `/work/gcs-grpc-testing/run_benchmarks.sh` read/write/copy context when available.
 - Sufficiency: The performance problem is behavioral and environment-sensitive; a controlled benchmark contract is the lowest tier that proves later comparisons are meaningful.
 
 Completion criteria:
@@ -245,15 +270,18 @@ Task decomposition guidance:
 Slug: `02-client-architecture-comparison`
 
 Goal:
-Choose the production architecture for native GCS gRPC client/channel behavior by comparing formalized custom generated-stub pooling against adopting or closely aligning with `google-cloud-cpp` `storage::MakeGrpcClient`.
+Choose the production architecture for native GCS gRPC client/channel behavior by comparing formalized custom generated-stub pooling against a separate-branch test of the higher-level `google-cloud-cpp` `storage::MakeGrpcClient`, for both read and write paths.
 
 Scope:
-- Compare persistent channel/client behavior, per-RPC context lifecycle, channel count defaults, DirectPath semantics, settings exposure, fake/test seams, profile-event accounting, throttling, cancellation handling, and streaming API fit.
+- Compare persistent channel/client behavior, per-RPC context lifecycle, channel count defaults, DirectPath semantics, settings exposure, fake/test seams, profile-event accounting, throttling, cancellation handling, read streaming API fit, and write/upload API fit.
+- Create or use a separate branch for the `storage::MakeGrpcClient` experiment; do not mix this exploratory implementation with the main custom-stub production path until P02 records a decision.
+- Test whether the higher-level `MakeGrpcClient` path can support ClickHouse's native GCS read/write needs, including direct connectivity through `google-c2p://`, profile events, cancellation, throttling, and fakes.
 - Decide whether P04 should formalize the custom `IStub`/round-robin path, wrap more upstream `google-cloud-cpp` internals, or move toward high-level `storage::MakeGrpcClient`.
 - Record rejected alternatives and why.
 
 Out of scope:
 - Production implementation of the chosen architecture.
+- Merging the `MakeGrpcClient` experiment branch before the P02 decision and review.
 - Benchmarking residual CPU/copy overhead.
 - Changing the GCS-as-`s3` baseline.
 
@@ -267,8 +295,9 @@ Inputs:
 - Investigation source evidence for `GCSClient`, upstream `google-cloud-cpp` defaults, and current prototype.
 
 Outputs:
-- Architecture decision specifying the P04 implementation direction and acceptance requirements.
-- Comparison matrix covering correctness, performance, compatibility, and testability.
+- Architecture decision specifying the P04 implementation direction and acceptance requirements for both read and write paths.
+- Separate-branch `MakeGrpcClient` experiment evidence, including branch name, diff summary, build status if attempted, and read/write benchmark or blocker results.
+- Comparison matrix covering correctness, read performance, write performance, compatibility, and testability.
 
 Downstream contract:
 - P04 may implement the selected architecture without reopening the high-level custom-versus-library decision unless new blocking evidence appears.
@@ -278,28 +307,30 @@ Assumptions exported:
 - Final architecture must be endpoint-aware or configurable and must not hardcode the prototype `16` channel count.
 
 Assumptions not exported:
-- That upstream `MakeGrpcClient` is automatically better; P02 must prove or reject it for ClickHouse's streaming and instrumentation needs.
+- That upstream `MakeGrpcClient` is automatically better; P02 must prove or reject it for ClickHouse's streaming, write, and instrumentation needs using the separate branch.
 
 Expected artifacts:
 - `plans/gcs-grpc-s3-perf-parity/02-client-architecture-comparison-review.md`: architecture decision and comparison summary.
-- Optional `tmp/gcs-grpc-s3-perf-parity/p02-client-architecture-comparison/`: throwaway prototype notes or measurement snippets if needed for the decision.
+- Separate branch for `storage::MakeGrpcClient` testing, named in the P02 notes/review.
+- Optional `tmp/gcs-grpc-s3-perf-parity/p02-client-architecture-comparison/`: throwaway prototype notes, benchmark summaries, branch diff summaries, or blocker logs needed for the decision.
 
 Verification approach:
 - Tier: Tier 3
-- Method: Manual architecture review against P01 results and vendored `google-cloud-cpp` source, because the output is a decision rather than executable behavior.
-- Sufficiency: No automated test can validate the architecture decision before implementation; the review must explicitly map each acceptance criterion and risk to the selected P04 path.
+- Method: Manual architecture review against P01 results, staging read/write evidence, vendored `google-cloud-cpp` source, and the separate-branch `MakeGrpcClient` experiment, because the output is a decision rather than executable production behavior.
+- Sufficiency: No automated test can validate the architecture decision before implementation; the review must explicitly map each acceptance criterion and risk to the selected P04 path and explain why the separate-branch `MakeGrpcClient` test was accepted or rejected.
 
 Completion criteria:
 - Decision records the chosen architecture and rejected alternatives.
 - Decision explains DirectPath/non-DirectPath channel policy.
-- Decision explains how ClickHouse profile events, throttling, fakes, and cancellation handling remain possible.
+- Decision records the `MakeGrpcClient` experiment branch, evidence, and outcome.
+- Decision explains how ClickHouse profile events, throttling, fakes, cancellation handling, and write/upload behavior remain possible.
 
 Risks and rollback:
-- Risk: `MakeGrpcClient` lacks required stream/control hooks. Mitigation: Select custom pooling or closer internal alignment. Rollback: Keep current generated-stub interface and formalize upstream-equivalent defaults.
-- Risk: Custom pooling duplicates too much upstream behavior. Mitigation: Narrow custom code to the minimum required for ClickHouse instrumentation. Rollback: Reopen P02 only with specific evidence.
+- Risk: `MakeGrpcClient` lacks required stream/control hooks. Mitigation: test it on a separate branch and select custom pooling or closer internal alignment if hooks are missing. Rollback: abandon the experiment branch and keep current generated-stub interface for P04.
+- Risk: Custom pooling duplicates too much upstream behavior. Mitigation: narrow custom code to the minimum required for ClickHouse instrumentation and compare against the separate-branch `MakeGrpcClient` evidence. Rollback: reopen P02 only with specific evidence.
 
 Task decomposition guidance:
-- Create tasks around decision evidence and tradeoff recording, not broad implementation.
+- Create tasks around decision evidence, separate-branch `MakeGrpcClient` testing, branch diff/benchmark capture, and tradeoff recording, not broad production implementation.
 
 ### P03: Bounded read parity
 
@@ -366,18 +397,19 @@ Task decomposition guidance:
 Slug: `04-client-channel-parity`
 
 Goal:
-Implement the P02-selected production-ready native GCS client/channel architecture so native reads are no longer bottlenecked by single-channel behavior or an unreviewed hardcoded prototype.
+Implement the P02-selected production-ready native GCS client/channel architecture so native reads are no longer bottlenecked by single-channel behavior and native writes no longer have an unmeasured multi-second parity gap against GCS-as-`s3`.
 
 Scope:
 - Implement endpoint-aware or configurable channel behavior according to the P02 decision.
 - Preserve persistent clients/channels and fresh per-RPC `grpc::ClientContext` instances.
 - Preserve ClickHouse-specific instrumentation and test/fake seams.
+- Investigate and address measured native write-path bottlenecks that plausibly share client/channel, request concurrency, or streaming behavior with reads.
 - Remove or replace any final hardcoded prototype channel count.
 
 Out of scope:
 - Bounded-read correctness already covered by P03.
 - Expected cancellation metrics cleanup covered by P05.
-- Residual external-buffer, copy, or allocation optimization unless needed to make the chosen architecture work.
+- Residual external-buffer, copy, or allocation optimization unless needed to make the chosen read/write architecture work.
 
 Dependencies:
 - P01
@@ -392,8 +424,8 @@ Inputs:
 - P03 bounded-read-correct native path.
 
 Outputs:
-- Production-ready native GCS client/channel behavior.
-- Evidence that the single-channel bottleneck is removed under the P01 benchmark.
+- Production-ready native GCS client/channel behavior for read and write workloads.
+- Evidence that the single-channel read bottleneck and the measured native write gap are addressed or explicitly attributed under the P01/P06 benchmark contract.
 
 Downstream contract:
 - P05 and P06 may assume final client/channel architecture is stable and reviewable.
@@ -407,25 +439,26 @@ Assumptions not exported:
 Expected artifacts:
 - `src/IO/GCS/GCSClient.cpp`: client/channel implementation changes.
 - `src/IO/GCS/GCSClient.h`: public/internal option surface if required by P02.
-- Targeted tests or benchmark evidence for channel behavior.
+- GCS object-storage write-path files if P02/P04 evidence shows the bottleneck is above `GCSClient`.
+- Targeted tests or benchmark evidence for read and write behavior.
 - `plans/gcs-grpc-s3-perf-parity/04-client-channel-parity-review.md`: phase review.
 
 Verification approach:
 - Tier: Tier 2
-- Method: Build `clickhouse` with output redirected to a build log, run P01 native and GCS-as-`s3` benchmarks, and compare elapsed time and request/profile events before and after channel implementation.
-- Sufficiency: The primary issue is query-level throughput; benchmark behavior is required to prove the channel bottleneck is removed.
+- Method: Build `clickhouse` with output redirected to a build log, run P01/P06 native and GCS-as-`s3` read/write benchmarks, and compare elapsed time, per-run trend, request counts, and profile events before and after channel/write-path implementation.
+- Sufficiency: The primary issue is workload-level throughput; benchmark behavior is required to prove the read channel bottleneck and write parity gap are addressed.
 
 Completion criteria:
 - No final hardcoded `16`-channel policy remains unless P02 explicitly justifies it through a setting/default contract.
 - DirectPath and non-DirectPath endpoint behavior are addressed according to P02.
-- Benchmark shows native GCS no longer has the prior single-channel-scale slowdown.
+- Benchmark shows native GCS no longer has the prior single-channel-scale read slowdown and no longer has the measured `7.34x` native write slowdown without a documented residual bottleneck.
 
 Risks and rollback:
 - Risk: Final architecture regresses DirectPath behavior. Mitigation: Use P01 endpoint evidence and P02 policy; test both endpoint modes if available. Rollback: Restore previous single-architecture behavior and mark endpoint policy unresolved.
 - Risk: Adopting upstream client APIs breaks instrumentation. Mitigation: Require P02 instrumentation mapping before implementation. Rollback: Revert to custom generated-stub path.
 
 Task decomposition guidance:
-- Create tasks from the P02 decision, with separate validation for endpoint policy, instrumentation, and benchmark behavior.
+- Create tasks from the P02 decision, with separate validation for endpoint policy, instrumentation, read benchmark behavior, and write benchmark behavior.
 
 ### P05: Cancellation metrics parity
 
@@ -490,23 +523,24 @@ Risks and rollback:
 Task decomposition guidance:
 - Create tasks around status classification boundaries and metric verification, not broad logging cleanup.
 
-### P06: Residual performance closure
+### P06: Residual read/write performance closure
 
 Slug: `06-residual-performance-closure`
 
 Goal:
-Close the remaining native GCS elapsed-time gap against GCS-as-`s3`, or produce measured evidence identifying the bounded residual bottleneck and follow-up recommendation.
+Close the remaining native GCS read and write elapsed-time gaps against GCS-as-`s3`, or produce measured evidence identifying bounded residual bottlenecks and follow-up recommendations.
 
 Scope:
-- Re-run the P01 benchmark after P03-P05.
-- Attribute residual elapsed-time differences using CPU, allocation, bytes, request counts, profile events, and logs.
-- Address only measured residual causes that are scoped to native GCS read parity, such as external-buffer integration, protobuf/Cord copy overhead, or read retry behavior if it affects benchmark stability.
+- Re-run the P01 benchmark after P03-P05, including read and write workloads from `/work/gcs-grpc-testing/run_benchmarks.sh`.
+- Attribute residual elapsed-time differences using CPU, allocation, bytes, request counts, profile events, query log entries, and logs.
+- Report per-run trends as well as medians, including native read/copy warm-up behavior where copy remains context.
+- Address only measured residual causes that are scoped to native GCS read/write parity, such as external-buffer integration, protobuf/Cord copy overhead, write request concurrency, upload stream behavior, or retry behavior if it affects benchmark stability.
 
 Out of scope:
 - Large unrelated refactors.
 - Generic object-storage redesign.
 - AWS S3 comparisons.
-- Write/copy/backup parity.
+- Copy or backup parity as primary goals unless the user explicitly expands scope again.
 
 Dependencies:
 - P05
@@ -514,18 +548,18 @@ Dependencies:
 Phase interface:
 
 Inputs:
-- P01 benchmark contract and threshold.
-- Stable bounded-read, client/channel, and cancellation-accounting behavior.
+- P01 benchmark contract, post-P01 staging benchmark evidence, and threshold.
+- Stable bounded-read, client/channel, write-path, and cancellation-accounting behavior.
 
 Outputs:
 - Final benchmark report and source changes only for measured residual causes.
-- Pass/fail statement against the P01 elapsed-time threshold.
+- Pass/fail statement against the read and write parity thresholds.
 
 Downstream contract:
-- Future plans may use the final benchmark report as the native GCS read-performance baseline.
+- Future plans may use the final benchmark report as the native GCS read/write performance baseline.
 
 Assumptions exported:
-- Native GCS read performance is either within the agreed parity threshold or the remaining bottleneck is measured and bounded.
+- Native GCS read and write performance are either within the agreed parity threshold or the remaining bottlenecks are measured and bounded.
 
 Assumptions not exported:
 - That improvements generalize beyond the recorded endpoint/workload without further benchmark evidence.
@@ -537,17 +571,18 @@ Expected artifacts:
 
 Verification approach:
 - Tier: Tier 2
-- Method: Run final repeated native and GCS-as-`s3` benchmarks from P01, compare median elapsed time against the P01 threshold, and record secondary metrics. If scoped residual fixes are made, rebuild with logged output and repeat the benchmark.
-- Sufficiency: The plan's primary success criterion is elapsed query behavior; final behavioral benchmark is required and sufficient for plan-level closure.
+- Method: Run final repeated native and GCS-as-`s3` read/write benchmarks from P01 and `/work/gcs-grpc-testing/run_benchmarks.sh`, compare median elapsed time against the P01/P06 thresholds, and record secondary metrics plus per-run trends. If scoped residual fixes are made, rebuild with logged output and repeat the benchmark.
+- Sufficiency: The plan's primary success criterion is read/write workload behavior; final behavioral benchmark is required and sufficient for plan-level closure.
 
 Completion criteria:
-- Native GCS median elapsed time meets the P01 threshold, or the phase review records a specific residual bottleneck with evidence and a recommended follow-up.
-- Secondary metrics do not show hidden regressions in bytes read, request count, CPU/allocation indicators, or error counters.
+- Native GCS read and write median elapsed times meet the P01/P06 thresholds, or the phase review records specific residual bottlenecks with evidence and recommended follow-ups.
+- Secondary metrics do not show hidden regressions in bytes read/written, request count, CPU/allocation indicators, or error counters.
 - Existing GCS-as-`s3` baseline behavior remains stable.
+- Per-run trend analysis is recorded, including whether native warm-up behavior affects interpretation.
 
 Risks and rollback:
-- Risk: Residual gap is environment noise. Mitigation: Use repeated medians and P01 environment contract. Rollback: Mark result inconclusive and require environment stabilization before further code changes.
-- Risk: Residual optimization destabilizes correctness. Mitigation: Keep changes scoped and benchmark with correctness-preserving `FORMAT Null` scans plus profile-event byte checks. Rollback: Revert residual optimization and retain measured bottleneck report.
+- Risk: Residual gap is environment noise. Mitigation: Use repeated medians, per-run trend reporting, and the P01 environment contract. Rollback: Mark result inconclusive and require environment stabilization before further code changes.
+- Risk: Residual optimization destabilizes correctness. Mitigation: Keep changes scoped and benchmark with correctness-preserving `FORMAT Null` scans plus read/write profile-event checks. Rollback: Revert residual optimization and retain measured bottleneck report.
 
 Task decomposition guidance:
 - Create tasks only for residual causes that P06 profiling can measure; do not pre-authorize speculative micro-optimizations.
@@ -572,7 +607,7 @@ Hard checks:
 Warnings:
 - The repository has pre-existing dirty source changes in GCS-related files; this plan records them as evidence-bearing but does not own or modify them.
 - `plans/` is ignored by the global gitignore in this environment, so the new plan file may not appear in normal `git status` output.
-- The `1.25x` elapsed-time threshold is an initial planning threshold and may be adjusted only by P01 with recorded benchmark/environment rationale.
+- The `1.25x` elapsed-time threshold is an initial planning threshold for read and write parity and may be adjusted only by P01/P06 with recorded benchmark/environment rationale.
 
 ## Review and handoff expectations
 
@@ -583,6 +618,11 @@ Warnings:
 ## Plan change log
 
 - 2026-05-12: Initial plan created from ready investigation baseline and resolved user answers.
+- 2026-05-12: Added staging validation instructions for `clickhouse-builder-0`, `/work/ch-dev`, remote builds, `start_server.sh`, `query_log`, and the existing native/S3 benchmark tables.
+- 2026-05-12: Recorded exact staging DirectPath evidence: `/work/gcs-grpc-testing/env.sh` uses the `google-c2p://` endpoint and native GCS reads/writes are confirmed working.
+- 2026-05-13: Recorded staging `/work/gcs-grpc-testing/run_benchmarks.sh` results from `/work/results/20260513T000127Z`; read median meets the provisional threshold, native write is much slower, native copy is faster than S3, and native read/copy speed up across iterations.
+- 2026-05-13: Expanded plan scope to include native GCS write parity based on user request and the `7.34x` native write median gap.
+- 2026-05-13: Required P02 to test the higher-level `google-cloud-cpp` `storage::MakeGrpcClient` path on a separate branch before choosing the final client architecture.
 
 ## Plan maintenance
 
