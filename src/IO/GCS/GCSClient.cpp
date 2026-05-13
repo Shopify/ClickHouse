@@ -15,6 +15,8 @@
 #    include <google/cloud/credentials.h>
 #    include <google/cloud/internal/unified_grpc_credentials.h>
 #    include <google/cloud/internal/url_encode.h>
+#    include <google/cloud/storage/grpc_plugin.h>
+#    include <google/cloud/storage/retry_policy.h>
 #    include <grpcpp/test/client_context_test_peer.h>
 #endif
 
@@ -818,6 +820,46 @@ std::shared_ptr<Client> createClient(const ClientSettings & settings)
     }
     std::shared_ptr<IStub> stub = std::make_shared<RoundRobinStub>(std::move(stubs));
     return std::make_shared<Client>(settings, std::move(stub), std::move(auth));
+}
+
+google::cloud::Options makeGrpcClientOptions(const ClientSettings & settings)
+{
+    assertGrpcAvailable();
+
+    google::cloud::Options options;
+    if (!settings.endpoint.empty())
+        options.set<google::cloud::EndpointOption>(settings.endpoint);
+
+    options.set<google::cloud::UnifiedCredentialsOption>(makeCredentials(settings));
+
+    if (!settings.user_project.empty())
+        options.set<google::cloud::UserProjectOption>(settings.user_project);
+
+    const auto retry_failures = maxAttempts(settings) - 1;
+    options.set<google::cloud::storage::RetryPolicyOption>(
+        google::cloud::storage::LimitedErrorCountRetryPolicy(static_cast<int>(retry_failures)).clone());
+
+    const auto request_timeout = std::chrono::milliseconds(settings.request_timeout_ms);
+    if (request_timeout > std::chrono::milliseconds::zero())
+        options.set<google::cloud::storage::TransferStallTimeoutOption>(
+            std::chrono::ceil<std::chrono::seconds>(request_timeout));
+
+    return options;
+}
+
+HighLevelClient::HighLevelClient(ClientSettings settings_, google::cloud::Options options_, google::cloud::storage::Client client_)
+    : settings(std::move(settings_))
+    , options(std::move(options_))
+    , client(std::move(client_))
+{
+    configureRequestThrottlerEvents(settings);
+}
+
+std::shared_ptr<HighLevelClient> createHighLevelClient(const ClientSettings & settings)
+{
+    auto options = makeGrpcClientOptions(settings);
+    auto client = google::cloud::storage::MakeGrpcClient(options);
+    return std::make_shared<HighLevelClient>(settings, std::move(options), std::move(client));
 }
 
 FakeReadStream::FakeReadStream(std::vector<google::storage::v2::ReadObjectResponse> responses_, grpc::Status finish_status_)

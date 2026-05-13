@@ -16,6 +16,7 @@
 
 #if USE_GOOGLE_CLOUD
 #    include <google/cloud/internal/unified_grpc_credentials.h>
+#    include <google/cloud/storage/client.h>
 #    include <google/protobuf/empty.pb.h>
 #    include <google/storage/v2/storage.grpc.pb.h>
 #    include <grpcpp/grpcpp.h>
@@ -138,6 +139,26 @@ private:
 };
 
 std::shared_ptr<Client> createClient(const ClientSettings & settings);
+
+google::cloud::Options makeGrpcClientOptions(const ClientSettings & settings);
+
+class HighLevelClient
+{
+public:
+    HighLevelClient(ClientSettings settings_, google::cloud::Options options_, google::cloud::storage::Client client_);
+
+    const ClientSettings & getSettings() const { return settings; }
+    const google::cloud::Options & getOptions() const { return options; }
+    google::cloud::storage::Client & getStorageClient() { return client; }
+    const google::cloud::storage::Client & getStorageClient() const { return client; }
+
+private:
+    ClientSettings settings;
+    google::cloud::Options options;
+    google::cloud::storage::Client client;
+};
+
+std::shared_ptr<HighLevelClient> createHighLevelClient(const ClientSettings & settings);
 
 class FakeReadStream final : public grpc::ClientReaderInterface<google::storage::v2::ReadObjectResponse>
 {

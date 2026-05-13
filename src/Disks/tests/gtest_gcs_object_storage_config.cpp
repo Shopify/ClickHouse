@@ -25,8 +25,9 @@
 
 #if USE_GOOGLE_CLOUD
 #    include <absl/strings/cord.h>
+#    include <google/cloud/storage/testing/mock_client.h>
 #endif
-
+#include <chrono>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -379,6 +380,50 @@ TEST_F(GCSObjectStorageConfigTest, NativeGCSConfigRequiresBucket)
 
 
 #if USE_GOOGLE_CLOUD
+TEST(GCSHighLevelClientAdapter, OptionsMapClientSettings)
+{
+    GCS::ClientSettings settings;
+    settings.endpoint = "google-c2p:///storage.googleapis.com";
+    settings.user_project = "billing-project";
+    settings.use_insecure_credentials_for_tests = true;
+    settings.request_timeout_ms = 1500;
+    settings.max_retry_attempts = 4;
+
+    auto options = GCS::makeGrpcClientOptions(settings);
+
+    ASSERT_TRUE(options.has<google::cloud::EndpointOption>());
+    EXPECT_EQ(settings.endpoint, options.get<google::cloud::EndpointOption>());
+    ASSERT_TRUE(options.has<google::cloud::UnifiedCredentialsOption>());
+    ASSERT_TRUE(options.has<google::cloud::UserProjectOption>());
+    EXPECT_EQ(settings.user_project, options.get<google::cloud::UserProjectOption>());
+    ASSERT_TRUE(options.has<google::cloud::storage::RetryPolicyOption>());
+    ASSERT_TRUE(options.has<google::cloud::storage::TransferStallTimeoutOption>());
+    EXPECT_EQ(
+        std::chrono::seconds(2),
+        options.get<google::cloud::storage::TransferStallTimeoutOption>());
+}
+
+TEST(GCSHighLevelClientAdapter, AcceptsMockStorageClient)
+{
+    auto mock = std::make_shared<google::cloud::storage::testing::MockClient>();
+    auto storage_client = google::cloud::storage::testing::UndecoratedClientFromMock(mock);
+
+    GCS::ClientSettings settings;
+    settings.endpoint = "storage.googleapis.com";
+    settings.user_project = "billing-project";
+    settings.use_insecure_credentials_for_tests = true;
+    auto options = GCS::makeGrpcClientOptions(settings);
+
+    GCS::HighLevelClient client(settings, options, std::move(storage_client));
+
+    EXPECT_EQ(settings.endpoint, client.getSettings().endpoint);
+    EXPECT_EQ(settings.user_project, client.getSettings().user_project);
+    ASSERT_TRUE(client.getOptions().has<google::cloud::EndpointOption>());
+    EXPECT_EQ(settings.endpoint, client.getOptions().get<google::cloud::EndpointOption>());
+    ASSERT_TRUE(client.getOptions().has<google::cloud::UnifiedCredentialsOption>());
+}
+
+
 TEST(GCSObjectStorageCore, FakeReadWriteListDeleteAndCopy)
 {
     auto fake_stub = std::make_shared<GCS::FakeStub>();
