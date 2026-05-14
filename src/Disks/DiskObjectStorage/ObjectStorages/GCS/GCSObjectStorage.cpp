@@ -23,6 +23,12 @@
 #include <future>
 #include <mutex>
 
+#if USE_AWS_S3
+#    include <Common/threadPoolCallbackRunner.h>
+#    include <Core/Settings.h>
+#    include <IO/WriteBufferFromS3.h>
+#endif
+
 #if USE_GOOGLE_CLOUD
 #    include <absl/strings/cord.h>
 #endif
@@ -44,6 +50,13 @@ extern const Event WriteBufferFromGCSRequestsErrors;
 
 namespace DB
 {
+
+namespace Setting
+{
+#if USE_AWS_S3
+extern const SettingsBool s3_validate_request_settings;
+#endif
+}
 
 namespace ErrorCodes
 {
@@ -993,7 +1006,17 @@ private:
 #endif
 
 
-#if USE_GOOGLE_CLOUD
+#if USE_GOOGLE_CLOUD && USE_AWS_S3
+GCSObjectStorage::GCSObjectStorage(
+    GCSObjectStorageSettings settings_,
+    std::shared_ptr<GCS::HighLevelClient> high_level_client_,
+    std::shared_ptr<const S3::Client> xml_multipart_client_)
+    : settings(std::move(settings_))
+    , high_level_client(std::move(high_level_client_))
+    , xml_multipart_client(std::move(xml_multipart_client_))
+{
+}
+#elif USE_GOOGLE_CLOUD
 GCSObjectStorage::GCSObjectStorage(GCSObjectStorageSettings settings_, std::shared_ptr<GCS::HighLevelClient> high_level_client_)
     : settings(std::move(settings_))
     , high_level_client(std::move(high_level_client_))
@@ -1064,10 +1087,48 @@ std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage disk '{}' is read-only", settings.disk_name);
     validateNativeGCSWriteSettings(write_settings);
     if (settings.write_transport == GCS::WriteTransport::XMLMultipart)
+    {
+#if USE_AWS_S3
+        if (!xml_multipart_client)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Native GCS XML multipart client is not initialized for disk '{}'", settings.disk_name);
+
+        S3::S3RequestSettings request_settings = settings.xml_request_settings;
+        if (auto query_context = CurrentThread::tryGetQueryContext();
+            query_context && !query_context->isBackgroundContext())
+        {
+            const auto & query_settings = query_context->getSettingsRef();
+            request_settings.updateFromSettings(
+                query_settings,
+                /* if_changed */ true,
+                query_settings[Setting::s3_validate_request_settings]);
+        }
+
+        ThreadPoolCallbackRunnerUnsafe<void> scheduler;
+        if (write_settings.s3_allow_parallel_part_upload)
+            scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::REMOTE_FS_WRITE_THREAD_POOL);
+
+        auto disk_write_settings = IObjectStorage::patchSettings(write_settings);
+        auto blob_storage_log = createBlobStorageLogWriter();
+        if (blob_storage_log)
+            blob_storage_log->local_path = object.local_path;
+
+        return std::make_unique<WriteBufferFromS3>(
+            xml_multipart_client,
+            settings.bucket,
+            objectName(object.remote_path),
+            write_settings.use_adaptive_write_buffer ? write_settings.adaptive_write_buffer_initial_size : buf_size,
+            request_settings,
+            std::move(blob_storage_log),
+            std::move(attributes),
+            std::move(scheduler),
+            disk_write_settings);
+#else
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
-            "Native GCS XML multipart write transport is configured for disk '{}' but writeObject integration is deferred to the XML multipart semantic validation phase",
-            settings.disk_name);
+            "Native GCS XML multipart write transport requires ClickHouse to be built with S3/XML multipart support (USE_AWS_S3)");
+#endif
+    }
+
     auto blob_storage_log = createBlobStorageLogWriter();
     if (blob_storage_log)
         blob_storage_log->local_path = object.local_path;
@@ -1357,6 +1418,14 @@ GCSObjectStorageSettings getGCSObjectStorageSettings(
     {
         GCS::assertXMLMultipartSupportAvailable();
         settings.xml_client_settings = GCS::makeXMLMultipartClientSettings(settings.client_settings, settings.xml_endpoint);
+#if USE_AWS_S3
+        settings.xml_request_settings = S3::S3RequestSettings(
+            config,
+            context->getSettingsRef(),
+            config_prefix,
+            "xml_multipart.",
+            context->getSettingsRef()[Setting::s3_validate_request_settings]);
+#endif
     }
 
     const auto get_request_throttler_max_speed = config.getUInt64(config_prefix + ".get_request_throttler_max_speed", 0);
@@ -1391,7 +1460,23 @@ ObjectStoragePtr createGCSObjectStorage(
 
 #if USE_GOOGLE_CLOUD
     auto high_level_client = GCS::createHighLevelClient(settings.client_settings);
+#if USE_AWS_S3
+    std::shared_ptr<const S3::Client> xml_multipart_client;
+    if (settings.write_transport == GCS::WriteTransport::XMLMultipart)
+    {
+        auto token_provider = GCS::createXMLBearerTokenProvider(settings.client_settings);
+        auto unique_xml_client = GCS::createXMLMultipartClient(
+            settings.client_settings,
+            settings.xml_endpoint,
+            context,
+            settings.disk_name,
+            token_provider);
+        xml_multipart_client = std::shared_ptr<S3::Client>(std::move(unique_xml_client));
+    }
+    return std::make_shared<GCSObjectStorage>(std::move(settings), std::move(high_level_client), std::move(xml_multipart_client));
+#else
     return std::make_shared<GCSObjectStorage>(std::move(settings), std::move(high_level_client));
+#endif
 #else
     throw Exception(
         ErrorCodes::NOT_IMPLEMENTED,
