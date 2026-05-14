@@ -1063,7 +1063,11 @@ std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
     if (settings.read_only)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Native GCS object storage disk '{}' is read-only", settings.disk_name);
     validateNativeGCSWriteSettings(write_settings);
-
+    if (settings.write_transport == GCS::WriteTransport::XMLMultipart)
+        throw Exception(
+            ErrorCodes::NOT_IMPLEMENTED,
+            "Native GCS XML multipart write transport is configured for disk '{}' but writeObject integration is deferred to the XML multipart semantic validation phase",
+            settings.disk_name);
     auto blob_storage_log = createBlobStorageLogWriter();
     if (blob_storage_log)
         blob_storage_log->local_path = object.local_path;
@@ -1346,6 +1350,14 @@ GCSObjectStorageSettings getGCSObjectStorageSettings(
     settings.client_settings.use_insecure_credentials_for_tests
         = config.getBool(config_prefix + ".use_insecure_credentials_for_tests", false);
     settings.client_settings.for_disk = true;
+    settings.write_transport = GCS::parseWriteTransport(config.getString(config_prefix + ".write_transport", GCS::writeTransportName(GCS::WriteTransport::Grpc)));
+    if (config.has(config_prefix + ".xml_endpoint"))
+        settings.xml_endpoint = expandConfigString(config, config_prefix + ".xml_endpoint", context);
+    if (settings.write_transport == GCS::WriteTransport::XMLMultipart)
+    {
+        GCS::assertXMLMultipartSupportAvailable();
+        settings.xml_client_settings = GCS::makeXMLMultipartClientSettings(settings.client_settings, settings.xml_endpoint);
+    }
 
     const auto get_request_throttler_max_speed = config.getUInt64(config_prefix + ".get_request_throttler_max_speed", 0);
     if (get_request_throttler_max_speed)

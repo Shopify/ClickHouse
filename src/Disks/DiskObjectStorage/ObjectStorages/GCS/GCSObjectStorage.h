@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <IO/GCS/GCSClient.h>
+#include <IO/GCS/GCSXMLClient.h>
 #include <Common/BlobStorageLogWriter.h>
 
 #include <functional>
@@ -20,6 +21,9 @@ struct GCSObjectStorageSettings
     String description;
     bool read_only = false;
     GCS::ClientSettings client_settings;
+    GCS::WriteTransport write_transport = GCS::WriteTransport::Grpc;
+    String xml_endpoint;
+    GCS::XMLMultipartClientSettings xml_client_settings;
     BlobStorageLogWriterFactory blob_storage_log_writer_factory;
 };
 

@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Local/MetadataStorageFromDisk.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/GCS/GCSObjectStorage.h>
+#include <IO/GCS/GCSXMLClient.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageFactory.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
@@ -678,7 +679,8 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
     GCSObjectStorageSettings::BlobStorageLogWriterFactory blob_storage_log_writer_factory = {},
     std::shared_ptr<google::cloud::internal::GrpcAuthenticationStrategy> auth = nullptr,
     String bucket = "native-bucket",
-    String endpoint = "storage.googleapis.com")
+    String endpoint = "storage.googleapis.com",
+    GCS::WriteTransport write_transport = GCS::WriteTransport::Grpc)
 {
     fake_stub->use_object_map = true;
 
@@ -691,6 +693,8 @@ std::shared_ptr<GCSObjectStorage> makeFakeGCSObjectStorage(
     settings.client_settings = std::move(client_settings);
     settings.client_settings.endpoint = std::move(endpoint);
     settings.client_settings.use_insecure_credentials_for_tests = true;
+    settings.write_transport = write_transport;
+    settings.xml_client_settings = GCS::makeXMLMultipartClientSettings(settings.client_settings, settings.xml_endpoint);
     settings.client_settings.for_disk = true;
     settings.blob_storage_log_writer_factory = std::move(blob_storage_log_writer_factory);
 
@@ -840,6 +844,141 @@ TEST_F(GCSObjectStorageConfigTest, NativeGCSConfigRequiresBucket)
         Exception);
 }
 
+TEST(GCSXMLMultipartEndpoint, NormalizesDefaultDirectPathAndCustomEndpoint)
+{
+    EXPECT_EQ("https://storage.googleapis.com", GCS::normalizeXMLMultipartEndpoint("storage.googleapis.com", ""));
+    EXPECT_EQ("https://storage.googleapis.com", GCS::normalizeXMLMultipartEndpoint("https://storage.googleapis.com", ""));
+    EXPECT_EQ("https://storage.googleapis.com", GCS::normalizeXMLMultipartEndpoint("google-c2p:///storage.googleapis.com", ""));
+    EXPECT_EQ("https://custom.googleapis.com", GCS::normalizeXMLMultipartEndpoint("storage.googleapis.com", "custom.googleapis.com"));
+    EXPECT_EQ("https://custom.googleapis.com", GCS::normalizeXMLMultipartEndpoint("storage.googleapis.com", "https://custom.googleapis.com"));
+    EXPECT_THROW(GCS::normalizeXMLMultipartEndpoint("storage.googleapis.com", "http://custom.googleapis.com"), Exception);
+    EXPECT_THROW(GCS::normalizeXMLMultipartEndpoint("custom.googleapis.com", ""), Exception);
+    EXPECT_THROW(GCS::normalizeXMLMultipartEndpoint("google-c2p:///other.googleapis.com", ""), Exception);
+}
+
+TEST(GCSXMLMultipartCredentialSeam, RepresentsCredentialModesHeadersAndRefresh)
+{
+    int token_requests = 0;
+    GCS::CallbackXMLBearerTokenProvider provider(
+        GCS::CredentialMode::ServiceAccountKey,
+        [&token_requests]
+        {
+            ++token_requests;
+            return GCS::XMLBearerToken{
+                .token = "token-" + std::to_string(token_requests),
+                .expiration = std::chrono::system_clock::now() + std::chrono::hours(1),
+            };
+        });
+
+    EXPECT_EQ(GCS::CredentialMode::ServiceAccountKey, provider.getCredentialMode());
+    EXPECT_EQ("token-1", provider.getToken().token);
+    EXPECT_EQ("token-2", provider.getToken().token);
+
+    GCS::ClientSettings default_settings;
+    default_settings.user_project = "billing-project";
+    auto default_xml_settings = GCS::makeXMLMultipartClientSettings(default_settings, "");
+    EXPECT_EQ(GCS::CredentialMode::GoogleDefault, default_xml_settings.credential_mode);
+    EXPECT_EQ("billing-project", default_xml_settings.user_project);
+
+    auto headers = GCS::makeXMLMultipartHeaders(default_settings);
+    ASSERT_EQ(1, headers.size());
+    EXPECT_EQ("x-goog-user-project", headers.front().name);
+    EXPECT_EQ("billing-project", headers.front().value);
+
+    GCS::ClientSettings service_account_settings;
+    service_account_settings.service_account_json = "{}";
+    auto service_account_xml_settings = GCS::makeXMLMultipartClientSettings(service_account_settings, "");
+    EXPECT_EQ(GCS::CredentialMode::ServiceAccountKey, service_account_xml_settings.credential_mode);
+
+    GCS::CallbackXMLBearerTokenProvider empty_provider(
+        GCS::CredentialMode::GoogleDefault,
+        []
+        {
+            return GCS::XMLBearerToken{};
+        });
+    EXPECT_THROW(empty_provider.getToken(), Exception);
+}
+
+#if USE_AWS_S3
+TEST(GCSXMLMultipartCredentialSeam, CreatesXMLMultipartClientWithFakeTokenProvider)
+{
+    GCS::ClientSettings settings;
+    settings.user_project = "billing-project";
+    settings.max_retry_attempts = 1;
+
+    auto provider = std::make_shared<GCS::CallbackXMLBearerTokenProvider>(
+        GCS::CredentialMode::GoogleDefault,
+        []
+        {
+            return GCS::XMLBearerToken{
+                .token = "fake-token",
+                .expiration = std::chrono::system_clock::now() + std::chrono::hours(1),
+            };
+        });
+
+    auto client = GCS::createXMLMultipartClient(settings, "", getContext().context, "native_gcs_disk", provider);
+
+    ASSERT_NE(nullptr, client);
+    EXPECT_EQ("https://storage.googleapis.com", client->getInitialEndpoint());
+    EXPECT_TRUE(client->getCredentials().IsEmpty());
+    EXPECT_EQ("fake-token", client->getGCSOAuthToken());
+
+    auto empty_provider = std::make_shared<GCS::CallbackXMLBearerTokenProvider>(
+        GCS::CredentialMode::GoogleDefault,
+        []
+        {
+            return GCS::XMLBearerToken{};
+        });
+    auto empty_client = GCS::createXMLMultipartClient(settings, "", getContext().context, "native_gcs_disk", empty_provider);
+    EXPECT_THROW(empty_client->getGCSOAuthToken(), Exception);
+}
+#endif
+
+TEST_F(GCSObjectStorageConfigTest, NativeGCSWriteTransportDefaultsToGrpc)
+{
+    auto config = makeNativeGCSConfig();
+    auto settings = getGCSObjectStorageSettings("native_gcs_disk", *config, "disk", getContext().context);
+
+    EXPECT_EQ(GCS::WriteTransport::Grpc, settings.write_transport);
+    EXPECT_TRUE(settings.xml_client_settings.endpoint.empty());
+}
+
+TEST_F(GCSObjectStorageConfigTest, NativeGCSGrpcTransportDoesNotValidateXMLEndpoint)
+{
+    auto config = makeNativeGCSConfig();
+    config->setString("disk.endpoint", "google-c2p:///other.googleapis.com");
+
+    auto settings = getGCSObjectStorageSettings("native_gcs_disk", *config, "disk", getContext().context);
+
+    EXPECT_EQ(GCS::WriteTransport::Grpc, settings.write_transport);
+    EXPECT_EQ("google-c2p:///other.googleapis.com", settings.client_settings.endpoint);
+    EXPECT_TRUE(settings.xml_client_settings.endpoint.empty());
+}
+
+TEST_F(GCSObjectStorageConfigTest, NativeGCSXMLMultipartWriteTransportConfig)
+{
+    auto config = makeNativeGCSConfig();
+    config->setString("disk.write_transport", "xml_multipart");
+    config->setString("disk.xml_endpoint", "xml.storage.test");
+
+#if USE_AWS_S3
+    auto settings = getGCSObjectStorageSettings("native_gcs_disk", *config, "disk", getContext().context);
+    EXPECT_EQ(GCS::WriteTransport::XMLMultipart, settings.write_transport);
+    EXPECT_EQ("xml.storage.test", settings.xml_endpoint);
+    EXPECT_EQ("https://xml.storage.test", settings.xml_client_settings.endpoint);
+#else
+    EXPECT_THROW(getGCSObjectStorageSettings("native_gcs_disk", *config, "disk", getContext().context), Exception);
+#endif
+}
+
+TEST_F(GCSObjectStorageConfigTest, NativeGCSRejectsInvalidWriteTransport)
+{
+    auto config = makeNativeGCSConfig();
+    config->setString("disk.write_transport", "obviously_not_a_transport");
+
+    EXPECT_THROW(getGCSObjectStorageSettings("native_gcs_disk", *config, "disk", getContext().context), Exception);
+}
+
 
 #if USE_GOOGLE_CLOUD
 TEST(GCSHighLevelClientAdapter, OptionsMapClientSettings)
@@ -945,6 +1084,24 @@ TEST(GCSObjectStorageCore, FakeReadWriteListDeleteAndCopy)
     EXPECT_FALSE(storage->exists(object));
     storage->removeObjectIfExists(object);
     EXPECT_TRUE(storage->exists(copied));
+}
+
+TEST(GCSObjectStorageCore, XMLMultipartWriteTransportFailsClosedBeforeWriterIntegration)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(
+        fake_stub,
+        /* read_only */ false,
+        {},
+        {},
+        nullptr,
+        "native-bucket",
+        "storage.googleapis.com",
+        GCS::WriteTransport::XMLMultipart);
+
+    StoredObject object("clickhouse-data/xml-mode-object", "xml-mode-object");
+    EXPECT_THROW(storage->writeObject(object, WriteMode::Rewrite, {}, 4, {}), Exception);
+    EXPECT_TRUE(fake_stub->write_object_requests.empty());
 }
 
 
