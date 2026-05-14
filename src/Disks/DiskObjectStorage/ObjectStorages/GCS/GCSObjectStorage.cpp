@@ -1089,6 +1089,10 @@ std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
     if (settings.write_transport == GCS::WriteTransport::XMLMultipart)
     {
 #if USE_AWS_S3
+        if (!write_settings.object_storage_write_if_none_match.empty())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Native GCS XML multipart write transport does not support object_storage_write_if_none_match until create-if-absent equivalence is validated");
         if (!xml_multipart_client)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Native GCS XML multipart client is not initialized for disk '{}'", settings.disk_name);
 

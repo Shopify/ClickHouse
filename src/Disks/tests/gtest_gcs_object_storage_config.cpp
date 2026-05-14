@@ -1151,6 +1151,27 @@ TEST(GCSObjectStorageCore, XMLMultipartWriteTransportRejectsIfMatchBeforeUpload)
     EXPECT_TRUE(fake_stub->write_object_requests.empty());
 }
 
+TEST(GCSObjectStorageCore, XMLMultipartWriteTransportRejectsIfNoneMatchBeforeUpload)
+{
+    auto fake_stub = std::make_shared<GCS::FakeStub>();
+    auto storage = makeFakeGCSObjectStorage(
+        fake_stub,
+        /* read_only */ false,
+        {},
+        {},
+        nullptr,
+        "native-bucket",
+        "storage.googleapis.com",
+        GCS::WriteTransport::XMLMultipart);
+
+    WriteSettings write_settings;
+    write_settings.object_storage_write_if_none_match = "*";
+    StoredObject object("clickhouse-data/xml-mode-object", "xml-mode-object");
+    EXPECT_THROW(storage->writeObject(object, WriteMode::Rewrite, {}, 4, write_settings), Exception);
+    EXPECT_TRUE(fake_stub->write_object_requests.empty());
+}
+
+
 #if USE_AWS_S3
 TEST(GCSObjectStorageCore, XMLMultipartWriteTransportConstructsS3WriteBufferWithNativeKey)
 {
