@@ -373,7 +373,7 @@ private:
 
     size_t sequentialWindowSizeForKnownFile() const
     {
-        size_t limit = std::max(internal_buffer.size(), internal_buffer.size() * 16);
+        size_t limit = std::max(internal_buffer.size(), internal_buffer.size() * 8);
         limit = std::max(limit, prefetch_buffer_size);
         if (read_hint)
             limit = std::max(limit, *read_hint);
