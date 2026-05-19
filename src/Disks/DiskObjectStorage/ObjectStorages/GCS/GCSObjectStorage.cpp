@@ -58,6 +58,14 @@ extern const SettingsBool s3_validate_request_settings;
 #endif
 }
 
+namespace S3RequestSetting
+{
+#if USE_AWS_S3
+extern const S3RequestSettingsUInt64 strict_upload_part_size;
+extern const S3RequestSettingsUInt64 max_single_part_upload_size;
+#endif
+}
+
 namespace ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
@@ -125,6 +133,17 @@ std::map<std::string, std::string> attributesToMap(const std::optional<ObjectAtt
         result.emplace(key, value);
     return result;
 }
+
+#if USE_AWS_S3
+void applyGCSXMLMultipartUploadDefaults(S3::S3RequestSettings & request_settings)
+{
+    if (request_settings[S3RequestSetting::strict_upload_part_size] == S3::DEFAULT_STRICT_UPLOAD_PART_SIZE)
+    {
+        request_settings[S3RequestSetting::strict_upload_part_size] = 64 * 1024 * 1024;
+        request_settings[S3RequestSetting::max_single_part_upload_size] = 64 * 1024 * 1024;
+    }
+}
+#endif
 
 void validateNativeGCSWriteSettings(const WriteSettings & write_settings)
 {
@@ -1097,6 +1116,7 @@ std::unique_ptr<WriteBufferFromFileBase> GCSObjectStorage::writeObject(
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Native GCS XML multipart client is not initialized for disk '{}'", settings.disk_name);
 
         S3::S3RequestSettings request_settings = settings.xml_request_settings;
+        applyGCSXMLMultipartUploadDefaults(request_settings);
         if (auto query_context = CurrentThread::tryGetQueryContext();
             query_context && !query_context->isBackgroundContext())
         {
