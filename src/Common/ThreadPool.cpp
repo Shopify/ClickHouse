@@ -452,6 +452,9 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, Priority priority, std:
         currently_available_threads = available_threads.load(std::memory_order_relaxed);
     }
 
+    /// Idle thread selected under the lock, to be notified after it is released.
+    ThreadFromThreadPool * thread_to_wake = nullptr;
+
     {
         Stopwatch watch;
         std::unique_lock lock(mutex);
@@ -567,13 +570,17 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, Priority priority, std:
         /// avoids a thundering herd where every idle thread wakes, contends for the
         /// mutex, and goes back to sleep on every job schedule.
         ///
-        /// Notify while still holding `mutex`: once `idle_wakeup_flag` is set, a
-        /// spurious wakeup is enough for the worker to run and remove itself from
-        /// the pool, so the raw `ThreadFromThreadPool` pointer must not be used
-        /// after the lock is released.
-        if (ThreadFromThreadPool * thread_to_wake = popNewestIdleThreadNoLock())
-            wakeIdleThreadNoLock(thread_to_wake);
+        /// The thread is selected here, but notified only after `mutex` is released.
+        /// Notifying under the mutex makes the woken worker block on the mutex right
+        /// away, and puts the futex wake (and a possible preemption of the waker) inside
+        /// the critical section. When the node is oversubscribed, that makes the lock
+        /// hold time grow with the run queue length. The selected thread is pinned by
+        /// `pending_wakeups`, so it cannot destroy itself before it is notified.
+        thread_to_wake = selectNewestIdleThreadToWakeNoLock();
     }
+
+    if (thread_to_wake)
+        notifySelectedIdleThread(thread_to_wake);
 
     ProfileEvents::increment(std::is_same_v<Thread, GlobalThreadType> ? ProfileEvents::GlobalThreadPoolJobs : ProfileEvents::LocalThreadPoolJobs);
 
@@ -835,6 +842,28 @@ void ThreadPoolImpl<Thread>::wakeIdleThreadNoLock(ThreadFromThreadPool * thread)
 }
 
 template <typename Thread>
+typename ThreadPoolImpl<Thread>::ThreadFromThreadPool * ThreadPoolImpl<Thread>::selectNewestIdleThreadToWakeNoLock()
+{
+    ThreadFromThreadPool * thread = popNewestIdleThreadNoLock();
+    if (thread)
+    {
+        thread->idle_wakeup_flag = true;
+        /// Relaxed is enough: it is read under the same mutex, or after `join` in `finalize`.
+        thread->pending_wakeups.fetch_add(1, std::memory_order_relaxed);
+    }
+    return thread;
+}
+
+template <typename Thread>
+void ThreadPoolImpl<Thread>::notifySelectedIdleThread(ThreadFromThreadPool * thread) noexcept
+{
+    thread->cv.notify_one();
+    /// The last access to `thread`. Release pairs with the acquire load in the worker exit path,
+    /// so the notification happens before the thread can be destroyed.
+    thread->pending_wakeups.fetch_sub(1, std::memory_order_release);
+}
+
+template <typename Thread>
 void ThreadPoolImpl<Thread>::wakeUpAllIdleThreadsNoLock()
 {
     while (ThreadFromThreadPool * thread = popOldestIdleThreadNoLock())
@@ -946,6 +975,9 @@ ThreadPoolImpl<Thread>::ThreadFromThreadPool::~ThreadFromThreadPool()
 
     join();
 
+    /// The worker does not leave its loop while a scheduler is still about to notify it.
+    chassert(pending_wakeups.load(std::memory_order_acquire) == 0);
+
     /// Diagnostic only: matched with `addLocalThreadPoolWorker` in the constructor.
     /// Placed after `join()` so that a hung join (the actual leaker symptom we care
     /// about) keeps the worker counted in `snapshotLocalThreadPools()`. For a leaked
@@ -1033,14 +1065,15 @@ void ThreadPoolImpl<Thread>::ThreadFromThreadPool::worker()
             /// LIFO idle thread scheduling: link this thread into the intrusive
             /// idle stack and wait on its own per-thread CV until selected. The
             /// scheduler pops the most recently idle thread from the stack, sets
-            /// its `idle_wakeup_flag`, and notifies only that thread's CV.
+            /// its `idle_wakeup_flag`, and notifies only that thread's CV (after
+            /// releasing the mutex, see `selectNewestIdleThreadToWakeNoLock`).
             ///
             /// The wait predicate also re-checks the real pool state. This is a
             /// required safety net: a previous attempt to drop it
             /// (commit `9322e66151ea`) deadlocked the
             /// `SchedulerWorkloadResourceManager.DropNotEmptyQueueLong` unit test
             /// under TSan. Even though every notifier
-            /// (`popNewestIdleThreadNoLock`, `wakeUpAllIdleThreadsNoLock`,
+            /// (`selectNewestIdleThreadToWakeNoLock`, `wakeUpAllIdleThreadsNoLock`,
             /// `wakeUpExcessIdleThreadsNoLock`) sets `idle_wakeup_flag` before
             /// notifying the per-thread CV, there are interleavings where a
             /// queued job becomes visible to this worker without a paired
@@ -1074,6 +1107,21 @@ void ThreadPoolImpl<Thread>::ThreadFromThreadPool::worker()
                 // We enter here if:
                 //  - either this thread is not needed anymore due to max_free_threads excess;
                 //  - or shutdown happened AND all jobs are already handled.
+
+                /// `scheduleImpl` notifies the selected thread after releasing the mutex, so a
+                /// scheduler may still be using `cv` of this thread: this thread may have been
+                /// woken by that `notify_one` (or spuriously) before the scheduler decremented
+                /// `pending_wakeups`. Wait for it outside of the mutex and re-evaluate. No new
+                /// wake-up can be added meanwhile, because this thread is not in the idle stack.
+                /// This path is rare: the thread must have woken up, finished a job and decided
+                /// to exit, all before the scheduler returned from `notifySelectedIdleThread`.
+                if (pending_wakeups.load(std::memory_order_acquire) != 0)
+                {
+                    lock.unlock();
+                    while (pending_wakeups.load(std::memory_order_acquire) != 0)
+                        std::this_thread::yield();
+                    continue;
+                }
 
                 if (parent_pool.threads_remove_themselves)
                     removeSelfFromPoolNoPoolLock(); // Detach and remove itself from the pool

@@ -80,6 +80,53 @@ TEST(ThreadPool, LIFONotifyWithThreadSelfRemoval)
     }
 }
 
+/// `scheduleImpl` selects an idle thread under the pool mutex but notifies it after releasing
+/// the mutex. The selected thread can be woken, run the job and decide to exit before the
+/// scheduler is done with it, so it must not be destroyed until the scheduler has finished
+/// notifying. With `max_free_threads = 1` at most one worker stays parked, and every worker that
+/// finishes a job while there is already a spare one exits. Several schedulers that each keep one
+/// short job in flight make workers park, get selected and exit all the time, so this interleaving
+/// is likely, especially when the CPUs are oversubscribed. A use-after-free here is reported by
+/// ASan, and a missed notification hangs the scheduler.
+TEST(ThreadPool, LIFOSelectedThreadExitsWhileBeingNotified)
+{
+    constexpr size_t schedulers = 8;
+    constexpr size_t jobs_per_scheduler = 5000;
+
+    ThreadPool pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled, 4, 1, 0);
+
+    /// Start the first worker from this thread, so that the implicit initialization of
+    /// `GlobalThreadPool` does not race between the scheduler threads.
+    pool.scheduleOrThrowOnError([] {});
+    pool.wait();
+
+    std::atomic<size_t> counter = 0;
+    std::vector<std::thread> threads;
+    threads.reserve(schedulers);
+    for (size_t i = 0; i < schedulers; ++i)
+    {
+        threads.emplace_back([&]
+        {
+            for (size_t j = 0; j < jobs_per_scheduler; ++j)
+            {
+                std::atomic<bool> done = false;
+                pool.scheduleOrThrowOnError([&]
+                {
+                    ++counter;
+                    done.store(true);
+                    done.notify_one();
+                });
+                done.wait(false);
+            }
+        });
+    }
+    for (auto & thread : threads)
+        thread.join();
+
+    pool.wait();
+    EXPECT_EQ(counter.load(), schedulers * jobs_per_scheduler);
+}
+
 /// Verify the LIFO contract directly. Two properties are checked:
 ///  - while one worker is busy, a probe job runs on the single idle worker;
 ///  - once both workers are idle, a sequence of non-overlapping jobs
