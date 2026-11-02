@@ -99,7 +99,10 @@ public:
         /// scheduler keeps its own reference to the CV. It is allocated when the thread
         /// object is created (`scheduleImpl`, `startNewThreadsNoLock`), which never runs in
         /// `DENY_ALLOCATIONS_IN_SCOPE`. The wake-up path only copies the pointer, which
-        /// does not allocate.
+        /// does not allocate. The last reference is dropped either by `scheduleImpl` after
+        /// the notification, or by the destructor of the thread object, which may run in
+        /// the worker itself under the pool mutex and in `DENY_ALLOCATIONS_IN_SCOPE`; that
+        /// is fine, because only allocations are denied there, not deallocations.
         std::shared_ptr<std::condition_variable> cv = std::make_shared<std::condition_variable>();
 
         /// LIFO idle thread scheduling flag.

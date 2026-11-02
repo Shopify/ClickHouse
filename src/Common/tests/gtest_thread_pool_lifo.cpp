@@ -1,5 +1,4 @@
 #include <Common/CurrentMetrics.h>
-#include <Common/ProfileEvents.h>
 #include <Common/ThreadPool.h>
 
 #include <atomic>
@@ -17,11 +16,6 @@ namespace CurrentMetrics
     extern const Metric LocalThread;
     extern const Metric LocalThreadActive;
     extern const Metric LocalThreadScheduled;
-}
-
-namespace ProfileEvents
-{
-    extern const Event LocalThreadPoolShrinks;
 }
 
 TEST(ThreadPool, LIFOStartsManyBlockingJobs)
@@ -113,14 +107,28 @@ TEST(ThreadPool, LIFOSelectedThreadExitsWhileBeingNotified)
         std::vector<Completion> completions(schedulers);
         std::atomic<size_t> timed_out = 0;
 
+        /// Workers of this pool are counted in `LocalThread` from entering to leaving their loop.
+        /// No other pool uses that metric during the test, so a drop below a value seen earlier
+        /// means that a worker left its loop while the pool is alive, i.e. removed itself.
+        std::atomic<CurrentMetrics::Value> peak_workers = 0;
+        std::atomic<size_t> worker_exits_seen = 0;
+        auto observe_workers = [&]
+        {
+            const auto workers = CurrentMetrics::get(CurrentMetrics::LocalThread);
+            auto peak = peak_workers.load();
+            while (workers > peak && !peak_workers.compare_exchange_weak(peak, workers))
+            {
+            }
+            if (workers < peak)
+                ++worker_exits_seen;
+        };
+
         ThreadPool pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled, 4, 1, 0);
 
         /// Start the first worker from this thread, so that the implicit initialization of
         /// `GlobalThreadPool` does not race between the scheduler threads.
         pool.scheduleOrThrowOnError([] {});
         pool.wait();
-
-        const auto shrinks_before = ProfileEvents::global_counters[ProfileEvents::LocalThreadPoolShrinks].load();
 
         std::vector<std::thread> threads;
         threads.reserve(schedulers);
@@ -144,21 +152,25 @@ TEST(ThreadPool, LIFOSelectedThreadExitsWhileBeingNotified)
                         ++timed_out;
                         return;
                     }
+                    lock.unlock();
+                    observe_workers();
                 }
             });
         }
         for (auto & thread : threads)
             thread.join();
 
-        pool.wait();
-
+        /// After a lost wake-up `pool.wait` could block forever. Fail instead; the destructor
+        /// of the pool wakes all idle threads, so the stuck job still runs and it returns.
         ASSERT_EQ(timed_out.load(), 0) << "A scheduled job was not picked up, a wake-up was lost";
+
+        pool.wait();
         for (auto & completion : completions)
             EXPECT_EQ(completion.completed, jobs_per_scheduler);
 
-        /// The race needs selected threads to exit, make sure the test still produces that.
-        const auto shrinks = ProfileEvents::global_counters[ProfileEvents::LocalThreadPoolShrinks].load() - shrinks_before;
-        EXPECT_GT(shrinks, 0u) << "No worker exited, the test does not exercise the race anymore";
+        /// The race needs workers that exit while the pool is in use. This checks that some do,
+        /// not that one exited exactly between the selection and the notification.
+        EXPECT_GT(worker_exits_seen.load(), 0u) << "No worker was seen removing itself from the pool";
     }
 }
 

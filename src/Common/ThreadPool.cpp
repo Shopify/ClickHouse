@@ -1057,15 +1057,15 @@ void ThreadPoolImpl<Thread>::ThreadFromThreadPool::worker()
             /// LIFO idle thread scheduling: link this thread into the intrusive
             /// idle stack and wait on its own per-thread CV until selected. The
             /// scheduler pops the most recently idle thread from the stack, sets
-            /// its `idle_wakeup_flag`, and notifies only that thread's CV (after
-            /// releasing the mutex, see `selectNewestIdleThreadToWakeNoLock`).
+            /// its `idle_wakeup_flag` (`selectNewestIdleThreadToWakeNoLock`), and
+            /// `scheduleImpl` notifies only that thread's CV after releasing the mutex.
             ///
             /// The wait predicate also re-checks the real pool state. This is a
             /// required safety net: a previous attempt to drop it
             /// (commit `9322e66151ea`) deadlocked the
             /// `SchedulerWorkloadResourceManager.DropNotEmptyQueueLong` unit test
-            /// under TSan. Even though every notifier
-            /// (`selectNewestIdleThreadToWakeNoLock`, `wakeUpAllIdleThreadsNoLock`,
+            /// under TSan. Even though every notifier (`scheduleImpl` via
+            /// `selectNewestIdleThreadToWakeNoLock`, `wakeUpAllIdleThreadsNoLock`,
             /// `wakeUpExcessIdleThreadsNoLock`) sets `idle_wakeup_flag` before
             /// notifying the per-thread CV, there are interleavings where a
             /// queued job becomes visible to this worker without a paired
