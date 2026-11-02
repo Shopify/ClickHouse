@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <memory>
 #include <optional>
 #include <atomic>
 #include <stack>
@@ -92,7 +93,14 @@ public:
         /// Each idle thread waits on its own CV, so the scheduler can wake the
         /// LIFO-selected thread directly without disturbing other idle threads.
         /// This avoids the thundering herd that a shared CV with `notify_all` creates.
-        std::condition_variable cv;
+        ///
+        /// It is shared because `scheduleImpl` notifies it after releasing the pool mutex:
+        /// by then the thread may have woken up, exited and been destroyed, so the
+        /// scheduler keeps its own reference to the CV. It is allocated when the thread
+        /// object is created (`scheduleImpl`, `startNewThreadsNoLock`), which never runs in
+        /// `DENY_ALLOCATIONS_IN_SCOPE`. The wake-up path only copies the pointer, which
+        /// does not allocate.
+        std::shared_ptr<std::condition_variable> cv = std::make_shared<std::condition_variable>();
 
         /// LIFO idle thread scheduling flag.
         /// When a new job is scheduled, the most recently idle thread is popped
@@ -102,13 +110,6 @@ public:
         /// against missed wake-ups, so a worker that wakes either directly or
         /// through a spurious CV signal will still pick up pending work.
         bool idle_wakeup_flag = false;
-
-        /// Number of schedulers that have popped this thread from the idle stack and set
-        /// `idle_wakeup_flag` under the pool mutex, but have not yet called `cv.notify_one`,
-        /// which they do after releasing the mutex. While it is non-zero the thread must not
-        /// be destroyed, because a notifier still holds a raw pointer to it. Incremented only
-        /// under the pool mutex and only while the thread is in the idle stack.
-        std::atomic<size_t> pending_wakeups = 0;
 
         /// Intrusive links in the parent pool idle stack. They avoid allocations
         /// in the worker idle path, which runs under `DENY_ALLOCATIONS_IN_SCOPE`.
@@ -265,13 +266,12 @@ private:
     ThreadFromThreadPool * popOldestIdleThreadNoLock();
     void wakeIdleThreadNoLock(ThreadFromThreadPool * thread);
 
-    /// Same as `popNewestIdleThreadNoLock` + `wakeIdleThreadNoLock`, but split so that the
-    /// notification happens after the mutex is released. `selectNewestIdleThreadToWakeNoLock`
-    /// must be called with the mutex held: it pops the most recently idle thread, sets its
-    /// `idle_wakeup_flag` and pins it with `pending_wakeups`. A returned thread must be passed
-    /// to `notifySelectedIdleThread` exactly once, after the mutex is released.
-    ThreadFromThreadPool * selectNewestIdleThreadToWakeNoLock();
-    static void notifySelectedIdleThread(ThreadFromThreadPool * thread) noexcept;
+    /// Like `popNewestIdleThreadNoLock` + `wakeIdleThreadNoLock`, but without the notification.
+    /// Must be called with mutex held. Pops the most recently idle thread, sets its
+    /// `idle_wakeup_flag` and returns a reference to its CV (or nullptr if no thread is idle).
+    /// The caller notifies the CV after releasing the mutex. The thread itself may be
+    /// destroyed by then, the returned reference keeps the CV alive.
+    std::shared_ptr<std::condition_variable> selectNewestIdleThreadToWakeNoLock();
 
     /// Wake all threads in the idle stack and set their wakeup flags (for shutdown).
     /// Must be called with mutex held.

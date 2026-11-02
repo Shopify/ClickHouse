@@ -1,4 +1,5 @@
 #include <Common/CurrentMetrics.h>
+#include <Common/ProfileEvents.h>
 #include <Common/ThreadPool.h>
 
 #include <atomic>
@@ -16,6 +17,11 @@ namespace CurrentMetrics
     extern const Metric LocalThread;
     extern const Metric LocalThreadActive;
     extern const Metric LocalThreadScheduled;
+}
+
+namespace ProfileEvents
+{
+    extern const Event LocalThreadPoolShrinks;
 }
 
 TEST(ThreadPool, LIFOStartsManyBlockingJobs)
@@ -80,51 +86,80 @@ TEST(ThreadPool, LIFONotifyWithThreadSelfRemoval)
     }
 }
 
-/// `scheduleImpl` selects an idle thread under the pool mutex but notifies it after releasing
-/// the mutex. The selected thread can be woken, run the job and decide to exit before the
-/// scheduler is done with it, so it must not be destroyed until the scheduler has finished
-/// notifying. With `max_free_threads = 1` at most one worker stays parked, and every worker that
-/// finishes a job while there is already a spare one exits. Several schedulers that each keep one
-/// short job in flight make workers park, get selected and exit all the time, so this interleaving
-/// is likely, especially when the CPUs are oversubscribed. A use-after-free here is reported by
-/// ASan, and a missed notification hangs the scheduler.
+/// `scheduleImpl` selects an idle thread under the pool mutex but notifies its CV after
+/// releasing the mutex. By then the selected thread may have woken up, decided to exit (with or
+/// without running a job) and been destroyed, so the notification must not touch the thread
+/// object. With `max_free_threads = 1` at most one worker stays parked, and a worker that
+/// finds a spare one already parked exits. Several schedulers that each keep one short job in
+/// flight make workers park, get selected and exit all the time, so this interleaving is
+/// likely, especially when the CPUs are oversubscribed. A use-after-free here is reported by
+/// ASan, and a lost wake-up makes a scheduler time out.
 TEST(ThreadPool, LIFOSelectedThreadExitsWhileBeingNotified)
 {
+    constexpr size_t iterations = 3;
     constexpr size_t schedulers = 8;
     constexpr size_t jobs_per_scheduler = 5000;
 
-    ThreadPool pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled, 4, 1, 0);
-
-    /// Start the first worker from this thread, so that the implicit initialization of
-    /// `GlobalThreadPool` does not race between the scheduler threads.
-    pool.scheduleOrThrowOnError([] {});
-    pool.wait();
-
-    std::atomic<size_t> counter = 0;
-    std::vector<std::thread> threads;
-    threads.reserve(schedulers);
-    for (size_t i = 0; i < schedulers; ++i)
+    /// One per scheduler. Declared before the pool, so it outlives every job.
+    struct Completion
     {
-        threads.emplace_back([&]
-        {
-            for (size_t j = 0; j < jobs_per_scheduler; ++j)
-            {
-                std::atomic<bool> done = false;
-                pool.scheduleOrThrowOnError([&]
-                {
-                    ++counter;
-                    done.store(true);
-                    done.notify_one();
-                });
-                done.wait(false);
-            }
-        });
-    }
-    for (auto & thread : threads)
-        thread.join();
+        std::mutex mutex;
+        std::condition_variable cv;
+        size_t completed = 0;
+    };
 
-    pool.wait();
-    EXPECT_EQ(counter.load(), schedulers * jobs_per_scheduler);
+    for (size_t iteration = 0; iteration < iterations; ++iteration)
+    {
+        std::vector<Completion> completions(schedulers);
+        std::atomic<size_t> timed_out = 0;
+
+        ThreadPool pool(CurrentMetrics::LocalThread, CurrentMetrics::LocalThreadActive, CurrentMetrics::LocalThreadScheduled, 4, 1, 0);
+
+        /// Start the first worker from this thread, so that the implicit initialization of
+        /// `GlobalThreadPool` does not race between the scheduler threads.
+        pool.scheduleOrThrowOnError([] {});
+        pool.wait();
+
+        const auto shrinks_before = ProfileEvents::global_counters[ProfileEvents::LocalThreadPoolShrinks].load();
+
+        std::vector<std::thread> threads;
+        threads.reserve(schedulers);
+        for (size_t i = 0; i < schedulers; ++i)
+        {
+            threads.emplace_back([&, i]
+            {
+                Completion & completion = completions[i];
+                for (size_t j = 1; j <= jobs_per_scheduler; ++j)
+                {
+                    pool.scheduleOrThrowOnError([&completion]
+                    {
+                        std::lock_guard lock(completion.mutex);
+                        ++completion.completed;
+                        completion.cv.notify_one();
+                    });
+
+                    std::unique_lock lock(completion.mutex);
+                    if (!completion.cv.wait_for(lock, std::chrono::seconds(30), [&] { return completion.completed == j; }))
+                    {
+                        ++timed_out;
+                        return;
+                    }
+                }
+            });
+        }
+        for (auto & thread : threads)
+            thread.join();
+
+        pool.wait();
+
+        ASSERT_EQ(timed_out.load(), 0) << "A scheduled job was not picked up, a wake-up was lost";
+        for (auto & completion : completions)
+            EXPECT_EQ(completion.completed, jobs_per_scheduler);
+
+        /// The race needs selected threads to exit, make sure the test still produces that.
+        const auto shrinks = ProfileEvents::global_counters[ProfileEvents::LocalThreadPoolShrinks].load() - shrinks_before;
+        EXPECT_GT(shrinks, 0u) << "No worker exited, the test does not exercise the race anymore";
+    }
 }
 
 /// Verify the LIFO contract directly. Two properties are checked:
