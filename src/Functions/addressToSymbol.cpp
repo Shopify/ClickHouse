@@ -1,11 +1,19 @@
 #if defined(__ELF__) && !defined(OS_FREEBSD)
+#   define HAS_SYMBOL_INDEX 1
+#elif defined(OS_DARWIN)
+#   define HAS_SYMBOL_INDEX 1
+#endif
+
+#if defined(HAS_SYMBOL_INDEX)
 
 #include <Common/SymbolIndex.h>
+
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypeString.h>
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
+#include <Functions/FunctionHelpers.h>
 #include <Access/Common/AccessFlags.h>
 #include <Interpreters/Context.h>
 
@@ -16,14 +24,12 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ILLEGAL_COLUMN;
-    extern const int ILLEGAL_TYPE_OF_ARGUMENT;
-    extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
 namespace
 {
 
-class FunctionAddressToSymbol : public IFunction
+class FunctionAddressToSymbol final : public IFunction
 {
 public:
     static constexpr auto name = "addressToSymbol";
@@ -43,21 +49,15 @@ public:
         return 1;
     }
 
+    /// Resolved against the executing node's own binary, like `buildId`.
+    bool isDeterministic() const override { return false; }
+    bool isServerConstant() const override { return true; }
+
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return true; }
 
-    DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
+    String getSignatureString() const override
     {
-        if (arguments.size() != 1)
-            throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Function {} needs exactly one argument; passed {}.",
-                getName(), arguments.size());
-
-        const auto & type = arguments[0].type;
-
-        if (!WhichDataType(type.get()).isUInt64())
-            throw Exception(ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT, "The only argument for function {} must be UInt64. "
-                "Found {} instead.", getName(), type->getName());
-
-        return std::make_shared<DataTypeString>();
+        return "(UInt64) -> String";
     }
 
     bool useDefaultImplementationForConstants() const override
@@ -67,8 +67,6 @@ public:
 
     ColumnPtr executeImpl(const ColumnsWithTypeAndName & arguments, const DataTypePtr &, size_t input_rows_count) const override
     {
-        const SymbolIndex & symbol_index = SymbolIndex::instance();
-
         const ColumnPtr & column = arguments[0].column;
         const ColumnUInt64 * column_concrete = checkAndGetColumn<ColumnUInt64>(column.get());
 
@@ -78,10 +76,17 @@ public:
         const typename ColumnVector<UInt64>::Container & data = column_concrete->getData();
         auto result_column = ColumnString::create();
 
+        const SymbolIndex & symbol_index = SymbolIndex::instance();
+
         for (size_t i = 0; i < input_rows_count; ++i)
         {
             if (const auto * symbol = symbol_index.findSymbol(reinterpret_cast<const void *>(data[i])))
-                result_column->insertData(symbol->name, strlen(symbol->name));
+            {
+                if (std::string_view symbol_name = symbol_index.getSymbolName(*symbol); !symbol_name.empty())
+                    result_column->insertData(symbol_name.data(), symbol_name.size());
+                else
+                    result_column->insertDefault();
+            }
             else
                 result_column->insertDefault();
         }
@@ -107,7 +112,7 @@ Converts virtual memory address inside the ClickHouse server process to a symbol
         "Selecting the first string from the `trace_log` system table",
         R"(
 SET allow_introspection_functions=1;
-SELECT * FROM system.trace_log LIMIT 1 \G;
+SELECT * FROM system.trace_log LIMIT 1 FORMAT Vertical;
         )",
         R"(
 -- The `trace` field contains the stack trace at the moment of sampling.
@@ -126,7 +131,7 @@ trace:         [94138803686098,94138815010911,94138815096522,94138815101224,9413
         "Getting a symbol for a single address",
         R"(
 SET allow_introspection_functions=1;
-SELECT addressToSymbol(94138803686098) \G;
+SELECT addressToSymbol(94138803686098) FORMAT Vertical;
         )",
         R"(
 Row 1:
@@ -146,7 +151,7 @@ SELECT
     arrayStringConcat(arrayMap(x -> addressToSymbol(x), trace), '\n') AS trace_symbols
 FROM system.trace_log
 LIMIT 1
-\G
+FORMAT Vertical;
         )",
         R"(
 Row 1:

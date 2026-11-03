@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Tags: no-fasttest
+# no-fasttest: Too slow for fast test (~11s), covered by regular stateless runs.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -13,7 +15,7 @@ TIMEOUT=10
 function thread()
 {
   I=0
-  while true
+  while clickhouse_test_time_left
   do
     [[ $SECONDS -gt $TIMEOUT ]] && break
     I=$((I+1))

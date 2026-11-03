@@ -70,7 +70,7 @@ size_t size(const Error & x)
 
 void read(OpNum & x, ReadBuffer & in)
 {
-    int32_t raw_op_num;
+    int32_t raw_op_num = 0;
     read(raw_op_num, in);
     x = getOpNum(raw_op_num);
 }
@@ -124,9 +124,13 @@ void read(Stat & stat, ReadBuffer & in)
 
 void read(Error & x, ReadBuffer & in)
 {
-    int32_t code;
+    int32_t code = 0;
     read(code, in);
-    x = Coordination::Error(code);
+    /// A code this client does not know (e.g. QUOTAEXCEEDED from a newer ZooKeeper) becomes the generic error of its range.
+    if (magic_enum::enum_contains<Error>(code))
+        x = static_cast<Error>(code);
+    else
+        x = code < static_cast<int32_t>(Error::ZAPIERROR) ? Error::ZAPIERROR : Error::ZSYSTEMERROR;
 }
 
 }

@@ -16,6 +16,7 @@ struct SignImpl
 {
     using ResultType = Int8;
     static constexpr bool allow_string_or_fixed_string = false;
+    static constexpr auto signature = "(Decimal | Integer | NativeFloat) -> Int8";
 
     ALWAYS_INLINE static NO_SANITIZE_UNDEFINED ResultType apply(A a)
     {
@@ -48,7 +49,7 @@ struct SignImpl
 
             if (sign)
             {
-                auto * is_negative = b.CreateICmpSLT(arg, res_zero);
+                auto * is_negative = b.CreateICmpSLT(arg, zero);
                 auto * select_zero = b.CreateSelect(is_zero, res_zero, res_one);
                 return b.CreateSelect(is_negative, res_minus_one, select_zero);
             }
