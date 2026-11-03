@@ -452,6 +452,9 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, Priority priority, std:
         currently_available_threads = available_threads.load(std::memory_order_relaxed);
     }
 
+    /// CV of the idle thread selected under the lock, to be notified after it is released.
+    std::shared_ptr<std::condition_variable> cv_to_notify;
+
     {
         Stopwatch watch;
         std::unique_lock lock(mutex);
@@ -567,13 +570,24 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, Priority priority, std:
         /// avoids a thundering herd where every idle thread wakes, contends for the
         /// mutex, and goes back to sleep on every job schedule.
         ///
-        /// Notify while still holding `mutex`: once `idle_wakeup_flag` is set, a
-        /// spurious wakeup is enough for the worker to run and remove itself from
-        /// the pool, so the raw `ThreadFromThreadPool` pointer must not be used
-        /// after the lock is released.
-        if (ThreadFromThreadPool * thread_to_wake = popNewestIdleThreadNoLock())
-            wakeIdleThreadNoLock(thread_to_wake);
+        /// The thread is selected here, but notified only after `mutex` is released.
+        /// Notifying under the mutex makes the woken worker block on the mutex right
+        /// away, and puts the futex wake (and a possible preemption of the waker) inside
+        /// the critical section. When the node is oversubscribed, that makes the lock
+        /// hold time grow with the run queue length.
+        ///
+        /// Once `mutex` is released, the selected thread can be woken (by this
+        /// notification, spuriously, or because its wait predicate sees a job or
+        /// shutdown), and it can decide to exit and destroy itself, with or without
+        /// running a job, before `notify_one` below returns. So only its CV is used
+        /// after unlocking, through a reference that keeps the CV alive.
+        cv_to_notify = selectNewestIdleThreadToWakeNoLock();
     }
+
+    /// If the thread has already woken up, this is a no-op or a spurious wake-up of a
+    /// thread that has parked again; its wait predicate handles both.
+    if (cv_to_notify)
+        cv_to_notify->notify_one();
 
     ProfileEvents::increment(std::is_same_v<Thread, GlobalThreadType> ? ProfileEvents::GlobalThreadPoolJobs : ProfileEvents::LocalThreadPoolJobs);
 
@@ -831,7 +845,17 @@ template <typename Thread>
 void ThreadPoolImpl<Thread>::wakeIdleThreadNoLock(ThreadFromThreadPool * thread)
 {
     thread->idle_wakeup_flag = true;
-    thread->cv.notify_one();
+    thread->cv->notify_one();
+}
+
+template <typename Thread>
+std::shared_ptr<std::condition_variable> ThreadPoolImpl<Thread>::selectNewestIdleThreadToWakeNoLock()
+{
+    ThreadFromThreadPool * thread = popNewestIdleThreadNoLock();
+    if (!thread)
+        return nullptr;
+    thread->idle_wakeup_flag = true;
+    return thread->cv;
 }
 
 template <typename Thread>
@@ -1033,14 +1057,15 @@ void ThreadPoolImpl<Thread>::ThreadFromThreadPool::worker()
             /// LIFO idle thread scheduling: link this thread into the intrusive
             /// idle stack and wait on its own per-thread CV until selected. The
             /// scheduler pops the most recently idle thread from the stack, sets
-            /// its `idle_wakeup_flag`, and notifies only that thread's CV.
+            /// its `idle_wakeup_flag` (`selectNewestIdleThreadToWakeNoLock`), and
+            /// `scheduleImpl` notifies only that thread's CV after releasing the mutex.
             ///
             /// The wait predicate also re-checks the real pool state. This is a
             /// required safety net: a previous attempt to drop it
             /// (commit `9322e66151ea`) deadlocked the
             /// `SchedulerWorkloadResourceManager.DropNotEmptyQueueLong` unit test
-            /// under TSan. Even though every notifier
-            /// (`popNewestIdleThreadNoLock`, `wakeUpAllIdleThreadsNoLock`,
+            /// under TSan. Even though every notifier (`scheduleImpl` via
+            /// `selectNewestIdleThreadToWakeNoLock`, `wakeUpAllIdleThreadsNoLock`,
             /// `wakeUpExcessIdleThreadsNoLock`) sets `idle_wakeup_flag` before
             /// notifying the per-thread CV, there are interleavings where a
             /// queued job becomes visible to this worker without a paired
@@ -1058,7 +1083,7 @@ void ThreadPoolImpl<Thread>::ThreadFromThreadPool::worker()
             {
                 idle_wakeup_flag = false;
                 parent_pool.pushIdleThreadNoLock(this);
-                cv.wait(lock, [this]
+                cv->wait(lock, [this]
                 {
                     return idle_wakeup_flag
                         || !parent_pool.jobs.empty()

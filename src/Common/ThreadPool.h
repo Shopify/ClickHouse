@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <memory>
 #include <optional>
 #include <atomic>
 #include <stack>
@@ -92,7 +93,17 @@ public:
         /// Each idle thread waits on its own CV, so the scheduler can wake the
         /// LIFO-selected thread directly without disturbing other idle threads.
         /// This avoids the thundering herd that a shared CV with `notify_all` creates.
-        std::condition_variable cv;
+        ///
+        /// It is shared because `scheduleImpl` notifies it after releasing the pool mutex:
+        /// by then the thread may have woken up, exited and been destroyed, so the
+        /// scheduler keeps its own reference to the CV. It is allocated when the thread
+        /// object is created (`scheduleImpl`, `startNewThreadsNoLock`), which never runs in
+        /// `DENY_ALLOCATIONS_IN_SCOPE`. The wake-up path only copies the pointer, which
+        /// does not allocate. The last reference is dropped either by `scheduleImpl` after
+        /// the notification, or by the destructor of the thread object, which may run in
+        /// the worker itself under the pool mutex and in `DENY_ALLOCATIONS_IN_SCOPE`; that
+        /// is fine, because only allocations are denied there, not deallocations.
+        std::shared_ptr<std::condition_variable> cv = std::make_shared<std::condition_variable>();
 
         /// LIFO idle thread scheduling flag.
         /// When a new job is scheduled, the most recently idle thread is popped
@@ -257,6 +268,13 @@ private:
     ThreadFromThreadPool * popNewestIdleThreadNoLock();
     ThreadFromThreadPool * popOldestIdleThreadNoLock();
     void wakeIdleThreadNoLock(ThreadFromThreadPool * thread);
+
+    /// Like `popNewestIdleThreadNoLock` + `wakeIdleThreadNoLock`, but without the notification.
+    /// Must be called with mutex held. Pops the most recently idle thread, sets its
+    /// `idle_wakeup_flag` and returns a reference to its CV (or nullptr if no thread is idle).
+    /// The caller notifies the CV after releasing the mutex. The thread itself may be
+    /// destroyed by then, the returned reference keeps the CV alive.
+    std::shared_ptr<std::condition_variable> selectNewestIdleThreadToWakeNoLock();
 
     /// Wake all threads in the idle stack and set their wakeup flags (for shutdown).
     /// Must be called with mutex held.
