@@ -1,0 +1,4 @@
+<clickhouse>
+    <custom_local_disks_base_directory>/var/lib/clickhouse/disks/</custom_local_disks_base_directory>
+    <custom_cached_disks_base_directory>/var/lib/clickhouse/caches/</custom_cached_disks_base_directory>
+</clickhouse>

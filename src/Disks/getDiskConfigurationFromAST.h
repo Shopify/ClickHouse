@@ -11,6 +11,8 @@ namespace DB
 
 using DiskConfigurationPtr = Poco::AutoPtr<Poco::Util::AbstractConfiguration>;
 
+inline constexpr auto S3_SERVER_CREDENTIALS_MARKER = "_server_credentials_allowed";
+
 /**
  * Transform a list of pairs ( key1=value1, key2=value2, ... ), where keys and values are ASTLiteral or ASTIdentifier
  * into
@@ -30,6 +32,8 @@ struct DynamicS3DiskCredentialInfo
 {
     /// The pre-resolution check decided the disk must be loaded anonymously (see `forceAnonymousS3DiskConfig`).
     bool load_anonymously = false;
+    /// Whether this definition relies on server-managed credentials rather than a literal safe auth form.
+    bool uses_server_credentials = false;
     /// The AST used `include`, so the resolved credentials' provenance cannot be trusted.
     bool has_include = false;
     /// The pre-resolution check exempted this disk from the restriction (e.g. a server-internal
@@ -70,6 +74,9 @@ void forceAnonymousS3DiskConfigAtPrefix(Poco::Util::AbstractConfiguration & conf
 /// backend with server-managed auth past the pre-resolution check. Throws `ACCESS_DENIED`, or forces the disk
 /// anonymous when loading from existing metadata (see `s3_load_table_anonymously_if_credentials_restricted`).
 void validateResolvedS3DiskCredentials(Poco::Util::AbstractConfiguration & config, ContextPtr context, bool is_loading_from_existing_metadata, const DynamicS3DiskCredentialInfo & info);
+
+/// Check the resolved root and every multi-location backend, not just the AST's declared type.
+bool diskUsesServerCredentials(const Poco::Util::AbstractConfiguration & config, const DynamicS3DiskCredentialInfo & info);
 
 /*
  * A reverse function.
