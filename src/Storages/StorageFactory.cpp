@@ -1,16 +1,17 @@
-#include <Storages/StorageFactory.h>
 #include <Access/Common/AccessRightsElement.h>
+#include <Core/Settings.h>
+#include <Disks/DiskFromAST.h>
+#include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/StorageID.h>
+#include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
-#include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Storages/StorageFactory.h>
 #include <Common/Exception.h>
 #include <Common/SettingsChanges.h>
 #include <Common/StringUtils.h>
-#include <Core/Settings.h>
-#include <IO/WriteHelpers.h>
-#include <Interpreters/StorageID.h>
 
 namespace DB
 {
@@ -219,6 +220,21 @@ StoragePtr StorageFactory::get(
 
     if (query.comment)
         comment = query.comment->as<ASTLiteral &>().value.safeGet<String>();
+
+    /// Check literal disk and policy selections for every engine under the querying session, not the global context.
+    /// Metadata reload is already authorized; selecting a new credential-bearing disk still needs the opt-in.
+    if (!isLoadingFromExistingMetadata(mode) && storage_def && storage_def->settings)
+    {
+        for (const auto & change : storage_def->settings->changes)
+        {
+            if (change.value.getType() != Field::Types::String)
+                continue;
+            if (change.name == "disk")
+                DiskFromAST::ensureDiskIsAllowed(change.value.safeGet<String>(), local_context);
+            else if (change.name == "storage_policy")
+                DiskFromAST::ensureStoragePolicyIsAllowed(change.value.safeGet<String>(), local_context);
+        }
+    }
 
     ASTs empty_engine_args;
     Arguments arguments{

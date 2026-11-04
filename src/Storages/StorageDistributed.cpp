@@ -5,6 +5,7 @@
 
 #include <Databases/IDatabase.h>
 
+#include <Disks/DiskFromAST.h>
 #include <Disks/IDisk.h>
 
 #include <QueryPipeline/RemoteQueryExecutor.h>
@@ -2288,6 +2289,9 @@ void registerStorageDistributed(StorageFactory & factory)
             engine_args[4] = evaluateConstantExpressionOrIdentifierAsLiteral(engine_args[4], local_context);
             storage_policy = checkAndGetLiteralArgument<String>(engine_args[4], "storage_policy");
         }
+
+        if (!isLoadingFromExistingMetadata(args.mode))
+            DiskFromAST::ensureStoragePolicyIsAllowed(storage_policy, local_context);
 
         /// TODO: move some arguments from the arguments to the SETTINGS.
         DistributedSettings distributed_settings = context->getDistributedSettings();

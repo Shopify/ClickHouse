@@ -1,13 +1,14 @@
 #include <DataTypes/DataTypeString.h>
-#include <Disks/DiskType.h>
+#include <Disks/DiskFromAST.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+#include <Disks/DiskType.h>
 #include <Interpreters/MergeTreeTransaction/VersionMetadata.h>
 #include <Storages/ColumnsDescription.h>
-#include <Storages/MergeTree/ConditionTemplate.h>
 #include <Storages/MergeTree/Compaction/MergeSelectors/ManualMergeSelector.h>
-#include <Storages/StorageProxy.h>
+#include <Storages/MergeTree/ConditionTemplate.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/PartitionCommands.h>
+#include <Storages/StorageProxy.h>
 #include <Common/CurrentThread.h>
 #include <Common/threadPoolCallbackRunner.h>
 
@@ -6116,6 +6117,8 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
 
             if (setting_name == "storage_policy")
             {
+                if (!current_value || *current_value != new_value)
+                    DiskFromAST::ensureStoragePolicyIsAllowed(new_value.safeGet<String>(), local_context);
                 checkStoragePolicy(local_context->getStoragePolicy(new_value.safeGet<String>()));
                 found_storage_policy_setting = true;
             }

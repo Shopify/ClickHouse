@@ -888,8 +888,11 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         /// User-initiated `ATTACH TABLE` queries, with a definition or in the short form, use
         /// `LoadingStrictnessLevel::ATTACH` and must still be subject to these checks.
         storage_settings->loadFromQuery(
-            *args.storage_def, args.getLocalContext(), isLoadingFromExistingMetadata(args.mode),
-            args.table_id.database_name == DatabaseCatalog::SYSTEM_DATABASE);
+            *args.storage_def,
+            args.getLocalContext(),
+            isLoadingFromExistingMetadata(args.mode),
+            args.table_id.database_name == DatabaseCatalog::SYSTEM_DATABASE,
+            /* stored_definition */ args.query.attach_short_syntax);
 
         /// What this query changes from the settings the server has in effect, which already include the
         /// `merge_tree` config section and `compatibility`: those are not changes made by the query. A
