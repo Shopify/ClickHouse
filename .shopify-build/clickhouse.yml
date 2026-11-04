@@ -1,0 +1,63 @@
+containers:
+  candidate:
+    application: clickhouse-fork
+    environment: dev
+    dockerfile:
+      dir: .shopify-build
+      path: Dockerfile
+      platform: linux/amd64
+      build_timeout: 6h
+      tag_latest: false
+      versioned_branches: "!*"
+
+default_container: candidate
+
+steps:
+  - build: candidate
+  - wait
+
+  - label: "Source provenance, SQL smoke and declared functional regressions"
+    timeout: 20m
+    run:
+      - python3 .shopify-build/test-source.py functional > artifacts/fork-ci/functional-driver.log 2>&1
+    artifact_paths:
+      - path: artifacts/fork-ci
+        required: true
+
+  - label: "MinIO S3 smoke and declared legacy-directory upgrade"
+    timeout: 20m
+    env:
+      # Public isolated fixture credentials, never production GCS credentials.
+      FORK_MINIO_ENDPOINT: http://minio:9000/clickhouse-fork-ci/data/
+      FORK_MINIO_KEY: forkciuser
+      FORK_MINIO_SECRET: forkcitestsecret12345
+    services:
+      minio:
+        image: us-docker.pkg.dev/shopify-docker-images/containers/cloud/minio@sha256:86551422f4e78d931067e9bed94bd8d3b3e7d6d6f87d682e30900f340353b081
+        command: ["server", "/data", "--address", ":9000"]
+        environment:
+          MINIO_ROOT_USER: forkciuser
+          MINIO_ROOT_PASSWORD: forkcitestsecret12345
+        healthcheck:
+          test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+          interval: 1s
+          timeout: 5s
+          retries: 30
+      minio-create-bucket:
+        image: us-docker.pkg.dev/shopify-docker-images/containers/cloud/minio@sha256:86551422f4e78d931067e9bed94bd8d3b3e7d6d6f87d682e30900f340353b081
+        environment:
+          MC_HOST_local: http://forkciuser:forkcitestsecret12345@minio:9000
+        entrypoint: ["/bin/sh", "-ec"]
+        command:
+          - |
+            attempt=0
+            until /usr/bin/mc mb --ignore-existing local/clickhouse-fork-ci; do
+              attempt=$((attempt + 1))
+              [ "$attempt" -lt 30 ] || exit 1
+              sleep 1
+            done
+    run:
+      - python3 .shopify-build/test-source.py minio > artifacts/fork-ci/minio-driver.log 2>&1
+    artifact_paths:
+      - path: artifacts/fork-ci
+        required: true
