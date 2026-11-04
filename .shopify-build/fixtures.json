@@ -1,0 +1,8 @@
+{
+  "legacy": {
+    "version": "26.3.33.24",
+    "url": "https://packages.clickhouse.com/tgz/stable/clickhouse-common-static-26.3.33.24-amd64.tgz",
+    "sha512": "1b34f7f01d61d0e994376bd9d42c594a1b3f84ccd0fe95e4da418d139ed71039f88a25b6c4185430f84c77b9cea4b0fe8e84e86263d6a1efa1abd480e3b9ef08",
+    "member": "clickhouse-common-static-26.3.33.24/usr/bin/clickhouse"
+  }
+}
